@@ -4,6 +4,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
 use std::env;
+use std::ffi::OsString;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::fs::remove_file;
@@ -28,6 +29,65 @@ use crate::login::token_data::parse_id_token;
 const SOURCE_FOR_PYTHON_SERVER: &str = include_str!("./login_with_chatgpt.py");
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+#[derive(Clone, Debug)]
+struct PythonLauncher {
+    program: OsString,
+    args: Vec<OsString>,
+}
+
+impl PythonLauncher {
+    fn new(program: impl Into<OsString>, args: &[&str]) -> Self {
+        Self {
+            program: program.into(),
+            args: args.iter().map(OsString::from).collect(),
+        }
+    }
+}
+
+fn python_candidates() -> Vec<PythonLauncher> {
+    let mut candidates = Vec::new();
+
+    if let Some(program) = env::var_os("RELAY_PYTHON").filter(|value| !value.is_empty()) {
+        candidates.push(PythonLauncher::new(program, &[]));
+    }
+
+    #[cfg(target_family = "windows")]
+    candidates.extend([
+        PythonLauncher::new("python", &[]),
+        PythonLauncher::new("py", &["-3"]),
+        PythonLauncher::new("python3", &[]),
+    ]);
+
+    #[cfg(not(target_family = "windows"))]
+    candidates.extend([
+        PythonLauncher::new("python3", &[]),
+        PythonLauncher::new("python", &[]),
+    ]);
+
+    candidates
+}
+
+fn find_python_launcher() -> io::Result<PythonLauncher> {
+    for candidate in python_candidates() {
+        let status = std::process::Command::new(&candidate.program)
+            .args(&candidate.args)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        if status.is_ok_and(|status| status.success()) {
+            return Ok(candidate);
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "Python 3 was not found; install Python or set RELAY_PYTHON to the interpreter path",
+    ))
+}
 pub const OPENAI_API_KEY_ENV_VAR: &str = "OPENAI_API_KEY";
 
 #[derive(Clone, Debug, PartialEq, Copy)]
@@ -61,9 +121,19 @@ impl CodexAuth {
         }
     }
 
-    /// Loads the available auth information for Codex Proxy Server from the auth.json file (in ~/.codex, ~/.opencode, or ./local_auth) or from the OPENAI_API_KEY environment variable. This supports both Codex Proxy Server and Opencode integration.
+    /// Loads auth.json from the requested directory, with the historical
+    /// OPENAI_API_KEY environment fallback enabled.
     pub fn from_codex_home(codex_home: &Path) -> std::io::Result<Option<CodexAuth>> {
         load_auth(codex_home, true)
+    }
+
+    /// Loads only the relay's dedicated auth.json. This deliberately ignores
+    /// ~/.codex, ~/.opencode, and OPENAI_API_KEY so accounts cannot mix.
+    pub fn from_auth_dir(auth_dir: &Path) -> std::io::Result<Option<CodexAuth>> {
+        match load_auth(auth_dir, false) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            result => result,
+        }
     }
 
     pub async fn get_token_data(&self) -> Result<TokenData, std::io::Error> {
@@ -307,8 +377,10 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(mut reader: R, buf: Arc<Mutex<Vec
 /// Spawn the ChatGPT login Python server as a child process and return a handle to its process.
 pub fn spawn_login_with_chatgpt(codex_home: &Path) -> std::io::Result<SpawnedLogin> {
     let script_path = write_login_script_to_disk()?;
-    let mut cmd = std::process::Command::new("python3");
-    cmd.arg(&script_path)
+    let launcher = find_python_launcher()?;
+    let mut cmd = std::process::Command::new(&launcher.program);
+    cmd.args(&launcher.args)
+        .arg(&script_path)
         .env("CODEX_HOME", codex_home)
         .env("CODEX_CLIENT_ID", CLIENT_ID)
         .stdin(Stdio::null())
@@ -334,8 +406,8 @@ pub fn spawn_login_with_chatgpt(codex_home: &Path) -> std::io::Result<SpawnedLog
     })
 }
 
-/// Run `python3 -c {{SOURCE_FOR_PYTHON_SERVER}}` with the CODEX_HOME
-/// environment variable set to the provided `codex_home` path. If the
+/// Run the bundled Python login helper with the CODEX_HOME environment
+/// variable set to the provided `codex_home` path. If the
 /// subprocess exits 0, read the OPENAI_API_KEY property out of
 /// CODEX_HOME/auth.json and return Ok(OPENAI_API_KEY). Otherwise, return Err
 /// with any information from the subprocess.
@@ -345,7 +417,9 @@ pub fn spawn_login_with_chatgpt(codex_home: &Path) -> std::io::Result<SpawnedLog
 /// current process's stdout/stderr.
 pub async fn login_with_chatgpt(codex_home: &Path, capture_output: bool) -> std::io::Result<()> {
     let script_path = write_login_script_to_disk()?;
-    let child = Command::new("python3")
+    let launcher = find_python_launcher()?;
+    let child = Command::new(&launcher.program)
+        .args(&launcher.args)
         .arg(&script_path)
         .env("CODEX_HOME", codex_home)
         .env("CODEX_CLIENT_ID", CLIENT_ID)
@@ -532,6 +606,12 @@ mod tests {
             assert_eq!(auth.mode, AuthMode::ApiKey);
             assert_eq!(auth.api_key, Some(env_var));
         }
+    }
+
+    #[test]
+    fn isolated_relay_auth_requires_its_own_file() {
+        let dir = tempdir().unwrap();
+        assert!(CodexAuth::from_auth_dir(dir.path()).unwrap().is_none());
     }
 
     #[tokio::test]

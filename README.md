@@ -1,121 +1,68 @@
-# Codex Proxy Server
+# Praxis Relay for Windows
 
-## Overview
+`relay` is a standalone Rust/Axum service that exposes a small OpenAI-compatible API on
+`127.0.0.1:5011` for a local Praxis deployment.
 
-The Codex Proxy Server is a secure, modular, and ergonomic proxy server built in Rust using the [Axum](https://github.com/tokio-rs/axum) framework. It provides a local API proxy for Codex/ChatGPT-like models, with robust authentication, logging, and server management features. It is designed to integrate seamlessly with Opencode and other compatible tools.
+This Windows-focused edition adds the Praxis model contract, multimodal input, hosted web
+search mapping, usage-limit reporting, a native Windows build, and a relay-owned OAuth store
+that stays isolated from the user's normal Codex credentials.
 
-**Note:** Codex Proxy Server uses code from the OpenAI Codex CLI and leverages OpenAI's authentication flow to access models and determine plan eligibility. This ensures compatibility with OpenAI's model access and plan system.
+## Upstream and license
 
-## Features
-- Secure authentication using local `auth.json` tokens
-- CLI menu for server management (start, stop, list servers, login, refresh token)
-- Health check and model listing endpoints
-- Safe Rust (no unsafe code)
-- Structured logging to `./logs/codex-proxy.log`
-- Cross-platform server management (Unix/macOS/Windows)
-- No hardcoded secrets, usernames, or tokens in source code
+This project is derived from
+[unluckyjori/Codex-Proxy-Server](https://github.com/unluckyjori/Codex-Proxy-Server)
+at upstream revision `57417d107dc100d4dfd15fd3fcf11350e9b71088`.
+The original project and this derivative are distributed under the MIT License. The original
+copyright and permission notice are preserved in [LICENSE](LICENSE).
 
-## Requirements
-- Rust (latest stable recommended)
-- Cargo (comes with Rust)
+This project is independently maintained and is not affiliated with or endorsed by OpenAI.
 
-## Quick Start
+It exposes:
 
-### 1. Download/Clone the Repository
-```sh
-git clone https://github.com/unluckyjori/Codex-Proxy-Server.git
-cd "Code"
+- `POST /chat/completions`
+- `GET /v1/models`
+- `GET /v1/limits`
+- `GET /health`
+
+## Run locally
+
+Install a current Rust toolchain, then run:
+
+```bash
+cd relay
+cargo run
 ```
 
-### 2. Build the Project (Required Once)
-```sh
-cargo build --release
+Choose `1` in the menu to start the server. The Dockerfile provides a container build for
+Linux deployments; the process deliberately binds only to loopback, so expose it through a
+separate reverse proxy only when that is an explicit deployment decision.
+
+### Windows
+
+Build and run the native executable from PowerShell:
+
+```powershell
+cargo build --release --locked
+Copy-Item .\target\release\codex-proxy-server.exe .\praxis-relay.exe
+.\praxis-relay.exe
 ```
 
-### 3. Run the Server
-```sh
-cargo run --release
-```
+The server itself does not require Python. Menu option `3` (interactive ChatGPT login) uses
+the first working Python 3 launcher among `python.exe`, `py.exe -3`, and `python3.exe`.
+Set `RELAY_PYTHON` to an explicit interpreter path if automatic discovery is unsuitable.
 
-### 4. Use the CLI Menu
-- **Run server**: Starts the proxy server on port 5011
-- **Close all servers**: Terminates all running proxy servers on ports 5011–5020
-- **Login**: Authenticates and stores your token in `~/.codex/auth.json`
-- **Refresh token**: Refreshes your authentication token
-- **List running servers**: Shows which ports are active
-- **Exit**: Quits the CLI
+### Separate relay authentication
 
-## Authentication
+The relay never reads `~/.codex/auth.json`, `~/.opencode/auth.json`, or the generic
+`OPENAI_API_KEY` environment variable. Its credentials live only in `local_auth/auth.json`
+next to the executable, matching the isolated `/app/local_auth` mount used on the server.
 
-Authentication and model access are handled using the same mechanisms as the OpenAI Codex CLI. Your plan type and model access are determined by your OpenAI account and authentication tokens. The server supports three locations for your authentication token (`auth.json`). It will search and create the token in the following order:
+On a clean installation, start the executable and choose menu option `3` to authorize the
+relay account. Then choose `1` to serve the API. To place credentials elsewhere, set
+`RELAY_AUTH_DIR` to an explicit directory before starting the relay.
 
-1. **`~/.codex/auth.json`** — Primary location (Codex CLI compatible)
-2. **`~/.opencode/auth.json`** — Secondary location (Opencode integration default)
-3. **`./local_auth/auth.json`** — Fallback location in the current working directory
+## Authentication and privacy
 
-**How it works:**
-- On first run, the server checks for `auth.json` in `~/.codex/`.
-- If not found or not writable, it tries `~/.opencode/`.
-- If both fail, it creates `auth.json` in a local folder called `local_auth` in your current directory.
-- The CLI will notify you where your token is stored. If using the fallback, you will see a warning and should move the file to `~/.codex/` or `~/.opencode/` for best compatibility.
-- The server will not start without valid authentication in one of these locations.
-
-## Important: OpenAI/Opencode Auth Reset
-
-If you have previously logged in to Opencode using OpenAI authentication, you must: (This is required for Opencode integration with Codex Proxy Server)
-
-1. Run the following command to log out of Opencode:
-   ```sh
-   opencode auth logout
-   ```
-2. Select OpenAI.
-3. After logging out, add the following provider configuration to your Opencode settings (in your `opencode.json` config):
-
-```json
-  "openai": {
-    "npm": "@ai-sdk/openai-compatible",
-    "name": "openai",
-    "options": {
-      "baseURL": "http://127.0.0.1:5011",
-      "apiKey": "auto"
-    },
-    "models": {
-      "gpt-5": {
-        "name": "gpt-5"
-      },
-      "gpt-5-mini": {
-        "name": "gpt-5-mini"
-      },
-      "gpt-5-nano": {
-        "name": "gpt-5-nano"
-      }
-    }
-  },
-```
-
-This ensures Opencode will use your local Codex Proxy Server for OpenAI-compatible requests.
-
-## Logging
-- All logs are written to the `logs` folder in the project directory (next to the executable): `Codex Proxy Server Rust/logs/codex-proxy.log` (created automatically).
-- You can find daily log files in this folder for troubleshooting and auditing, regardless of where you run the server from.
-
-## Security
-- No hardcoded secrets, usernames, or tokens in source code
-- All sensitive data is loaded from external files
-- CORS and secure headers are enforced (customize as needed)
-
-## Server Endpoints
-- `POST /chat/completions` — Chat completions API
-- `GET /v1/models` — List available models
-- `GET /health` — Health check
-
-## Notes
-- You must build the project once before running it (`cargo build --release`).
-- The server runs locally on port 5011 by default.
-- For production, run behind a TLS proxy (e.g., Nginx, Caddy) for HTTPS support.
-
-## License
-MIT
-
-## Contributing
-Pull requests and issues are welcome!
+The relay reads authentication only from its dedicated auth directory. Never commit
+`auth.json`, API keys, session files, or relay logs. This public copy contains source code
+and test fixtures only; it deliberately contains no account data.

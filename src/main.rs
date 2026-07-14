@@ -1,17 +1,17 @@
 use axum::{
-    extract::State,
+    extract::{rejection::JsonRejection, DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response, Json, sse::Event},
+    response::{sse::Event, IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio_stream::StreamExt;
-use tracing::{info, error, debug, warn};
+use tower_http::cors::CorsLayer;
+use tracing::{error, info, warn};
 use tracing_appender;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use tower_http::cors::CorsLayer;
 
 // Modules
 mod core;
@@ -19,7 +19,11 @@ mod login;
 
 use core::chat_completions;
 use core::config::Config;
-use core::models::{ChatRequest, Model, ModelList};
+use core::limits::LimitsCache;
+use core::models::{
+    is_supported_model, supported_model_list, ChatRequest, ModelList, MAX_CHAT_REQUEST_BYTES,
+    SUPPORTED_MODELS,
+};
 use login::lib::CodexAuth;
 
 // For CLI menu
@@ -34,82 +38,90 @@ static SERVER_HANDLES: Lazy<Mutex<Vec<JoinHandle<()>>>> = Lazy::new(|| Mutex::ne
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
+    limits: LimitsCache,
 }
 
 #[tokio::main]
 async fn main() {
-    // Always write logs to the logs folder in the project directory
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| std::env::current_dir().unwrap());
-    let logs_dir = exe_dir.join("logs");
+    // The container runs from /app, whose logs directory is the persisted
+    // compose mount. RELAY_LOG_DIR keeps non-container deployments explicit.
+    let logs_dir = std::env::var_os("RELAY_LOG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join("logs")
+        });
     if let Err(e) = std::fs::create_dir_all(&logs_dir) {
         eprintln!("Failed to create logs directory: {}", e);
     }
     // Initialize tracing with both console and file output
-    let file_appender = tracing_appender::rolling::daily(logs_dir, "codex-proxy.log");
+    let file_appender = tracing_appender::rolling::daily(logs_dir.clone(), "relay.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "codex_proxy=info,tower_http=info".into())
+                .unwrap_or_else(|_| "codex_proxy=info,tower_http=info".into()),
         )
-        .with(tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stdout)
-            .with_ansi(true)
-            .with_target(false)
-            .with_thread_ids(false)
-            .with_thread_names(false))
-        .with(tracing_subscriber::fmt::layer()
-            .with_writer(non_blocking)
-            .with_ansi(false)
-            .with_target(true)
-            .with_thread_ids(true)
-            .with_thread_names(true))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stdout)
+                .with_ansi(true)
+                .with_target(false)
+                .with_thread_ids(false)
+                .with_thread_names(false),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(non_blocking)
+                .with_ansi(false)
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_thread_names(true),
+        )
         .init();
 
     info!("=== Starting Codex Proxy Server ==="); // Codex Proxy Server
-    info!("Log file: logs/codex-proxy.log in the project directory (next to the executable). Compatible with Opencode integration.");
+    info!("Log directory: {}", logs_dir.display());
     info!("Timestamp: {}", chrono::Utc::now().to_rfc3339());
 
     // Display CLI menu
     loop {
         display_menu();
         let choice = get_user_choice();
-        
+
         match choice.as_str() {
             "1" => {
                 if let Err(e) = run_server().await {
                     error!("Failed to start server: {}", e);
                 }
-            },
+            }
             "2" => {
                 // Close all servers functionality
                 if let Err(e) = close_all_servers().await {
                     error!("Failed to close servers: {}", e);
                 }
-            },
+            }
             "3" => {
                 if let Err(e) = run_login().await {
                     error!("Login failed: {}", e);
                 }
-            },
+            }
             "4" => {
                 if let Err(e) = refresh_token().await {
                     error!("Token refresh failed: {}", e);
                 }
-            },
+            }
             "5" => {
                 println!("Exiting...");
                 break;
-            },
+            }
             "6" => {
                 if let Err(e) = list_running_servers().await {
                     error!("Failed to list running servers: {}", e);
                 }
-            },
+            }
             _ => {
                 println!("Invalid choice. Please try again.");
             }
@@ -119,49 +131,25 @@ async fn main() {
 
 async fn run_login() -> anyhow::Result<()> {
     info!("Starting login process");
-    let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-    let codex_home = home_dir.join(".codex");
-    let opencode_home = home_dir.join(".opencode");
-    let codex_auth_path = codex_home.join("auth.json");
-    let opencode_auth_path = opencode_home.join("auth.json");
+    let config = Config::load()?;
+    let auth_dir = config.codex_home;
+    let auth_path = auth_dir.join("auth.json");
 
-    // Try to read or create in .codex first
-    std::fs::create_dir_all(&codex_home)?;
-    println!("Codex home directory: {:?}", codex_home);
-    println!("Expected auth file path: {:?}", codex_auth_path);
+    std::fs::create_dir_all(&auth_dir)?;
+    println!("Relay auth directory: {:?}", auth_dir);
+    println!("Relay auth file: {:?}", auth_path);
+    println!("This login is isolated from ~/.codex and ~/.opencode.");
 
-    let mut used_opencode = false;
-    let login_result = login::lib::login_with_chatgpt(&codex_home, false).await;
-    if login_result.is_err() || !codex_auth_path.exists() {
-        // If failed or file not created, try .opencode
-        println!("Could not create or find auth.json in .codex, switching to .opencode directory (Opencode integration)...");
-        std::fs::create_dir_all(&opencode_home)?;
-        let login_result2 = login::lib::login_with_chatgpt(&opencode_home, false).await;
-        if login_result2.is_err() || !opencode_auth_path.exists() {
-            // Third fallback: create ./local_auth directory in current working directory
-            let local_auth_dir = std::env::current_dir()?.join("local_auth");
-            std::fs::create_dir_all(&local_auth_dir)?;
-            let local_auth_path = local_auth_dir.join("auth.json");
-            println!("Could not create or find auth.json in .codex or .opencode, switching to ./local_auth directory (local fallback)...");
-            let login_result3 = login::lib::login_with_chatgpt(&local_auth_dir, false).await;
-            if login_result3.is_err() || !local_auth_path.exists() {
-                return Err(anyhow::anyhow!("Login failed: Could not create auth.json in .codex, .opencode, or ./local_auth directory."));
-            }
-            println!("Auth file created successfully at: {:?} (local fallback, move to ~/.codex or ~/.opencode for best compatibility)", local_auth_path);
-            println!("WARNING: Using local fallback directory for authentication. Move auth.json to ~/.codex or ~/.opencode for best compatibility and Opencode integration.");
-            return Ok(());
-        }
-        used_opencode = true;
-    }
-
-    if used_opencode {
-        println!("Auth file created successfully at: {:?} (Opencode integration)", opencode_auth_path);
-    } else {
-        println!("Auth file created successfully at: {:?} (Codex Proxy Server)", codex_auth_path);
+    login::lib::login_with_chatgpt(&auth_dir, false).await?;
+    if !auth_path.is_file() {
+        return Err(anyhow::anyhow!(
+            "Login completed without creating the relay auth file at {:?}",
+            auth_path
+        ));
     }
 
     info!("Login successful");
-    println!("Login completed!");
+    println!("Relay login completed: {:?}", auth_path);
     Ok(())
 }
 
@@ -179,7 +167,9 @@ fn display_menu() {
 
 fn get_user_choice() -> String {
     let mut choice = String::new();
-    io::stdin().read_line(&mut choice).expect("Failed to read input");
+    io::stdin()
+        .read_line(&mut choice)
+        .expect("Failed to read input");
     choice.trim().to_string()
 }
 
@@ -203,18 +193,25 @@ async fn run_server() -> anyhow::Result<()> {
         Ok(_) => info!("Authentication check passed"),
         Err(e) => {
             error!("Authentication check failed: {}", e);
-            error!("Please use the 'Login' option in the CLI menu. This will enable Opencode and other integrations.");
+            error!("Choose menu option 3 (Login) to create the relay's separate authorization.");
             return Err(e);
         }
     }
 
     // Create app state
-    let app_state = AppState { config };
+    let app_state = AppState {
+        config,
+        limits: LimitsCache::default(),
+    };
 
     // Create router
     let app = Router::new()
-        .route("/chat/completions", post(chat_completions_handler))
+        .route(
+            "/chat/completions",
+            post(chat_completions_handler).layer(DefaultBodyLimit::max(MAX_CHAT_REQUEST_BYTES)),
+        )
         .route("/v1/models", get(models_handler))
+        .route("/v1/limits", get(limits_handler))
         .route("/health", get(health_handler))
         .layer(CorsLayer::permissive())
         .with_state(app_state);
@@ -232,32 +229,32 @@ async fn run_server() -> anyhow::Result<()> {
 
 async fn refresh_token() -> anyhow::Result<()> {
     println!("Refreshing token...");
-    
+
     // Load configuration
     let config = Config::load()?;
-    
-    // Get the codex auth
-    let codex_auth = match CodexAuth::from_codex_home(&config.codex_home) {
-    Ok(Some(auth)) => auth,
-    _ => {
-        return Err(anyhow::anyhow!("No authentication found. Please use the 'Login' option in the CLI menu. This enables Opencode and other integrations."));
-    }
-};
 
-// Get token data which will automatically refresh if needed
-let token_data = match codex_auth.get_token_data().await {
-    Ok(data) => data,
-    Err(_) => {
-        return Err(anyhow::anyhow!("No authentication found. Please use the 'Login' option in the CLI menu. This enables Opencode and other integrations."));
-    }
-};
-    
+    // Get the codex auth
+    let codex_auth = match CodexAuth::from_auth_dir(&config.codex_home) {
+        Ok(Some(auth)) => auth,
+        _ => {
+            return Err(anyhow::anyhow!("Dedicated relay authentication was not found. Choose menu option 3 (Login)."));
+        }
+    };
+
+    // Get token data which will automatically refresh if needed
+    let token_data = match codex_auth.get_token_data().await {
+        Ok(data) => data,
+        Err(_) => {
+            return Err(anyhow::anyhow!("Relay token data is unavailable. Choose menu option 3 (Login)."));
+        }
+    };
+
     println!("Token refreshed successfully!");
     match &token_data.account_id {
         Some(account_id) => println!("Account ID: {}", account_id),
         None => println!("Account ID: None"),
     }
-    
+
     Ok(())
 }
 
@@ -299,9 +296,7 @@ fn get_pids_for_port(port: u16) -> Vec<u32> {
     #[cfg(target_family = "windows")]
     {
         use std::process::Command;
-        let output = Command::new("netstat")
-            .arg("-ano")
-            .output();
+        let output = Command::new("netstat").arg("-ano").output();
         if let Ok(out) = output {
             let stdout = String::from_utf8_lossy(&out.stdout);
             stdout
@@ -325,10 +320,7 @@ fn kill_pid(pid: u32) -> bool {
     #[cfg(target_family = "unix")]
     {
         use std::process::Command;
-        let status = Command::new("kill")
-            .arg("-9")
-            .arg(pid.to_string())
-            .status();
+        let status = Command::new("kill").arg("-9").arg(pid.to_string()).status();
         status.map(|s| s.success()).unwrap_or(false)
     }
     #[cfg(target_family = "windows")]
@@ -342,7 +334,6 @@ fn kill_pid(pid: u32) -> bool {
         status.map(|s| s.success()).unwrap_or(false)
     }
 }
-
 
 // Utility: Check if a port is in use (cross-platform)
 fn is_port_in_use(port: u16) -> bool {
@@ -363,9 +354,7 @@ fn is_port_in_use(port: u16) -> bool {
             eprintln!("lsof failed for port {}", port);
         }
         // Fallback to netstat
-        let netstat_output = Command::new("netstat")
-            .arg("-an")
-            .output();
+        let netstat_output = Command::new("netstat").arg("-an").output();
         if let Ok(out) = netstat_output {
             let stdout = String::from_utf8_lossy(&out.stdout);
             if stdout.contains(&format!(":{}", port)) {
@@ -379,9 +368,7 @@ fn is_port_in_use(port: u16) -> bool {
     #[cfg(target_family = "windows")]
     {
         use std::process::Command;
-        let output = Command::new("netstat")
-            .arg("-ano")
-            .output();
+        let output = Command::new("netstat").arg("-ano").output();
         if let Ok(out) = output {
             let stdout = String::from_utf8_lossy(&out.stdout);
             if stdout.contains(&format!(":{}", port)) {
@@ -409,84 +396,51 @@ async fn list_running_servers() -> anyhow::Result<()> {
     Ok(())
 }
 
-
 async fn check_authentication(config: &Config) -> anyhow::Result<()> {
-    info!("Checking authentication in directory: {:?}", &config.codex_home);
+    info!(
+        "Checking authentication in directory: {:?}",
+        &config.codex_home
+    );
     let auth_file_path = config.codex_home.join("auth.json");
     info!("Looking for auth file at: {:?}", auth_file_path);
-    
-    if auth_file_path.exists() {
-        info!("Auth file found!");
-        // Try to read the file to check if it's valid
-        match std::fs::read_to_string(&auth_file_path) {
-            Ok(content) => {
-                // Auth file content preview removed for security
-            }
-            Err(e) => {
-                error!("Error reading auth file: {}", e);
-                return Err(anyhow::anyhow!("Failed to read auth file: {}", e));
-            }
-        }
-    } else {
-        warn!("Auth file not found!");
-        // List files in the directory to see what's there
-        if let Ok(entries) = std::fs::read_dir(&config.codex_home) {
-            info!("Files in codex home directory:");
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    info!("  - {}", entry.file_name().to_string_lossy());
-                }
-            }
-        }
-        
-        // Check if we're in .codex or .opencode and provide specific guidance
-        if let Some(home_dir) = dirs::home_dir() {
-            let codex_path = home_dir.join(".codex");
-            let opencode_path = home_dir.join(".opencode");
-            
-            if config.codex_home == codex_path {
-                info!("Looking in .codex directory. Checking if auth file exists in .opencode...");
-                let opencode_auth = opencode_path.join("auth.json");
-                if opencode_auth.exists() {
-                    info!("Found auth file in .opencode directory. Consider moving it to .codex for better compatibility.");
-                }
-            } else if config.codex_home == opencode_path {
-                info!("Looking in .opencode directory. Checking if auth file exists in .codex...");
-                let codex_auth = codex_path.join("auth.json");
-                if codex_auth.exists() {
-                    info!("Found auth file in .codex directory. Using that instead.");
-                }
-            }
-        }
-    }
-    
-    let codex_auth = match CodexAuth::from_codex_home(&config.codex_home) {
-    Ok(Some(auth)) => auth,
-    _ => {
-        return Err(anyhow::anyhow!("No authentication found. Please use the 'Login' option in the CLI menu. This enables Opencode and other integrations."));
-    }
-};
 
-let token_data = match codex_auth.get_token_data().await {
-    Ok(data) => data,
-    Err(_) => {
-        return Err(anyhow::anyhow!("No authentication found. Please use the 'Login' option in the CLI menu. This enables Opencode and other integrations."));
+    if !auth_file_path.is_file() {
+        warn!("Dedicated relay auth file not found");
+        return Err(anyhow::anyhow!(
+            "No relay authentication found at {:?}. Choose menu option 3 (Login) first.",
+            auth_file_path
+        ));
     }
-};
 
-if token_data.access_token.is_empty() {
-    return Err(anyhow::anyhow!("No authentication found. Please use the 'Login' option in the CLI menu. This enables Opencode and other integrations."));
-}
+    let codex_auth = match CodexAuth::from_auth_dir(&config.codex_home) {
+        Ok(Some(auth)) => auth,
+        _ => {
+            return Err(anyhow::anyhow!("Relay auth.json is invalid. Choose menu option 3 (Login) to replace it."));
+        }
+    };
 
-if token_data.account_id.is_none() {
-    return Err(anyhow::anyhow!("No authentication found. Please use the 'Login' option in the CLI menu. This enables Opencode and other integrations."));
-}
-    
+    let token_data = match codex_auth.get_token_data().await {
+        Ok(data) => data,
+        Err(_) => {
+            return Err(anyhow::anyhow!("Relay token data is unavailable. Choose menu option 3 (Login)."));
+        }
+    };
+
+    if token_data.access_token.is_empty() {
+        return Err(anyhow::anyhow!("Relay access token is empty. Choose menu option 3 (Login)."));
+    }
+
+    if token_data.account_id.is_none() {
+        return Err(anyhow::anyhow!("Relay account ID is unavailable. Choose menu option 3 (Login)."));
+    }
+
     // Log token information for debugging
     info!("Authentication successful");
-    info!("Account ID: {}", token_data.account_id.as_deref().unwrap_or("None"));
-    info!("Plan type: {}", codex_auth.get_plan_type().as_deref().unwrap_or("None"));
-    
+    info!(
+        "Plan type: {}",
+        codex_auth.get_plan_type().as_deref().unwrap_or("None")
+    );
+
     Ok(())
 }
 
@@ -495,7 +449,7 @@ async fn health_handler() -> Json<serde_json::Value> {
     let response = serde_json::json!({
         "status": "healthy",
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "service": "codex-proxy-server",
+        "service": "relay",
         "version": env!("CARGO_PKG_VERSION")
     });
     info!("✅ Health check response: {}", response);
@@ -504,60 +458,111 @@ async fn health_handler() -> Json<serde_json::Value> {
 
 async fn models_handler(State(_state): State<AppState>) -> Json<ModelList> {
     info!("📋 Models endpoint requested");
-    let models = vec![
-        Model {
-            id: "gpt-5".to_string(),
-            object: "model".to_string(),
-            created: chrono::Utc::now().timestamp(),
-            owned_by: "chatgpt".to_string(),
-        },
-        Model {
-            id: "gpt-5-mini".to_string(),
-            object: "model".to_string(),
-            created: chrono::Utc::now().timestamp(),
-            owned_by: "chatgpt".to_string(),
-        },
-        Model {
-            id: "gpt-5-nano".to_string(),
-            object: "model".to_string(),
-            created: chrono::Utc::now().timestamp(),
-            owned_by: "chatgpt".to_string(),
+    // Built from core::models::SUPPORTED_MODELS — the single source of truth also
+    // used by the request validator below, so the two can never disagree.
+    let list = supported_model_list();
+    info!("✅ Returning {} available models", list.data.len());
+    Json(list)
+}
+
+async fn limits_handler(State(state): State<AppState>) -> Response {
+    match state.limits.get(&state.config).await {
+        Ok(value) => {
+            let mut response = Json(value.clone()).into_response();
+            core::limits::apply_response_headers(response.headers_mut(), &value);
+            response
         }
-    ];
-    
-    info!("✅ Returning {} available models", models.len());
-    Json(ModelList {
-        object: "list".to_string(),
-        data: models,
-    })
+        Err(error) => {
+            warn!("Limits request failed: {}", error);
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": "OpenAI usage limits are temporarily unavailable",
+                        "type": "upstream_error",
+                        "code": "limits_unavailable"
+                    }
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn chat_completions_handler(
     State(state): State<AppState>,
     _headers: HeaderMap,
-    Json(request): Json<ChatRequest>,
+    payload: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Response, StatusCode> {
+    let request = match payload {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            let status = rejection.status();
+            let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                "request_too_large"
+            } else {
+                "invalid_json"
+            };
+            return Ok((
+                status,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": rejection.body_text(),
+                        "type": "invalid_request_error",
+                        "param": null,
+                        "code": code
+                    }
+                })),
+            )
+                .into_response());
+        }
+    };
+
     info!("🚀 CHAT COMPLETIONS REQUEST RECEIVED!");
-    info!("Request model: {}", request.model);
+    info!(
+        "Request model supported: {}",
+        is_supported_model(&request.model)
+    );
     info!("Request messages count: {}", request.messages.len());
     info!("Request tools count: {}", request.tools.len());
-    debug!("Full request: {:?}", request);
-    
-    // Validate model
-    if !request.model.starts_with("gpt-5") {
-        warn!("Invalid model requested: {}", request.model);
+    info!("Request image parts count: {}", request.image_part_count());
+
+    // Validate model against the single source of truth (core::models::SUPPORTED_MODELS),
+    // not a prefix — the old starts_with("gpt-5") let bogus slugs through and would
+    // reject future models. The 404 message lists the real supported set.
+    if !is_supported_model(&request.model) {
+        warn!("Invalid model requested (value redacted)");
         return Ok((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": {
-                    "message": format!("Model not found. Verify the slug starts with 'gpt-5' (e.g. 'gpt-5', 'gpt-5-mini', 'gpt-5-nano') and try again. Requested: {}", request.model),
+                    "message": format!("Model not found. Supported models: {}. Requested: {}", SUPPORTED_MODELS.join(", "), request.model),
                     "type": "model_not_found",
                     "code": "model_not_found"
                 }
             }))
         ).into_response());
     }
-    
+
+    if let Err(validation_error) = request.validate_content() {
+        warn!(
+            "Invalid message content at {}: {}",
+            validation_error.param, validation_error.message
+        );
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": validation_error.to_string(),
+                    "type": "invalid_request_error",
+                    "param": validation_error.param,
+                    "code": "invalid_message_content"
+                }
+            })),
+        )
+            .into_response());
+    }
+
     // Process the chat completion
     match chat_completions::stream_chat_completions(&state.config, request).await {
         Ok(response_stream) => {
@@ -586,7 +591,7 @@ async fn chat_completions_handler(
                         }
                     }
                 });
-            
+
             Ok(axum::response::Sse::new(sse_stream).into_response())
         }
         Err(e) => {
@@ -600,8 +605,9 @@ async fn chat_completions_handler(
                         "type": "server_error",
                         "code": "internal_error"
                     }
-                }))
-            ).into_response())
+                })),
+            )
+                .into_response())
         }
     }
 }
