@@ -23,8 +23,8 @@ $ErrorActionPreference = "Stop"
 $script:ExpectedVersion = "6.64.0"
 $script:ExpectedSourceSha = "ffcd09770438f2ebf78b3ec775ec23084e66994b"
 $script:ExpectedBundleSha256 = "4bf57a342da9ca07e2255c0b93f9e2002c6cc2ab82fe48b60b623831b089866d"
-$script:ExpectedPatchSha256 = "7207e4a6cdd23b698df70fe98074461d227cfd6c026f747552a5c417cfecc027"
-$script:MarkerRelativePath = ".ouroboros-patches/praxis-relay-v1.json"
+$script:ExpectedPatchSha256 = "b5e1dd0c1e4dbb6f3e4f99051aa0f49084adfa4d23bb54c4b1833cb194df6824"
+$script:MarkerRelativePath = ".ouroboros-patches/praxis-relay-v3.json"
 $script:GitPath = ""
 $script:ManagedRepoPath = ""
 
@@ -390,7 +390,7 @@ function Update-PraxisRelaySettings {
         $mainModel = "openai-compatible::" + $SelectedModel
         $lightModel = "openai-compatible::gpt-5.4-mini"
         $values = [ordered]@{
-            OPENAI_COMPATIBLE_BASE_URL = "http://localhost:5011"
+            OPENAI_COMPATIBLE_BASE_URL = "http://localhost:8088"
             OPENAI_COMPATIBLE_API_KEY = "auto"
             OUROBOROS_MODEL = $mainModel
             OUROBOROS_MODEL_HEAVY = $mainModel
@@ -423,7 +423,7 @@ function Update-PraxisRelaySettings {
         }
 
         $verify = Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($verify.OPENAI_COMPATIBLE_BASE_URL -ne "http://localhost:5011" -or
+        if ($verify.OPENAI_COMPATIBLE_BASE_URL -ne "http://localhost:8088" -or
             $verify.OPENAI_COMPATIBLE_API_KEY -ne "auto" -or
             $verify.OUROBOROS_MODEL -ne $mainModel) {
             throw "The persisted settings did not pass verification."
@@ -446,19 +446,22 @@ function Test-ConfiguredRoute {
     $snapshot = Get-EnvironmentSnapshot $names
     try {
         $env:PYTHONPATH = $script:ManagedRepoPath + ";" + $BundleRoot
-        $env:OPENAI_COMPATIBLE_BASE_URL = "http://localhost:5011"
+        $env:OPENAI_COMPATIBLE_BASE_URL = "http://localhost:8088"
         $env:OPENAI_COMPATIBLE_API_KEY = "auto"
         $env:PATCH_EXPECTED_MODEL = $SelectedModel
         $code = @'
 import os
-from ouroboros.llm import LLMClient
+from ouroboros.llm import LLMClient, _attempt_request
 model = os.environ['PATCH_EXPECTED_MODEL']
 target = LLMClient()._resolve_remote_target('openai-compatible::' + model)
 assert target['provider'] == 'openai-compatible', target
-assert target['base_url'] == 'http://localhost:5011', target
+assert target['base_url'] == 'http://localhost:8088', target
 assert target['api_key'] == 'auto', target
 assert target['resolved_model'] == model, target
-print('route-smoke: openai-compatible -> localhost:5011 -> ' + model)
+assert target['subscription_backed'] is True, target
+reservation = _attempt_request(target, {'model': model, 'max_tokens': 32})
+assert reservation.max_budget_usd == 0.0, reservation
+print('route-smoke: openai-compatible -> localhost:8088 -> ' + model)
 '@
         $nativeErrorPreference = $ErrorActionPreference
         try {
@@ -479,17 +482,38 @@ print('route-smoke: openai-compatible -> localhost:5011 -> ' + model)
 
 function Test-RelayIfRunning {
     $expected = @("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
+    $response = $null
+    $reader = $null
     try {
-        $catalog = Invoke-RestMethod -Uri "http://localhost:5011/v1/models" -Headers @{ Authorization = "Bearer auto" } -TimeoutSec 2
-        $actual = @($catalog.data | ForEach-Object { [string]$_.id })
+        $request = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:8088/v1/models")
+        $request.Proxy = $null
+        $request.Timeout = 2000
+        $request.ReadWriteTimeout = 2000
+        $request.Headers["Authorization"] = "Bearer auto"
+        $response = $request.GetResponse()
+        $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
+        $catalog = $reader.ReadToEnd() | ConvertFrom-Json
+        $items = @($catalog.data)
+        $actual = @($items | ForEach-Object { [string]$_.id })
         $missing = @($expected | Where-Object { $actual -notcontains $_ })
-        if ($missing.Count -gt 0) {
-            Write-Warning ("Relay is running, but its model catalog is missing: " + ($missing -join ", "))
-        } else {
-            Write-Step "Live relay catalog matches all six selector models"
+        $unexpected = @($actual | Where-Object { $expected -notcontains $_ })
+        if ($missing.Count -gt 0 -or $unexpected.Count -gt 0) {
+            Write-Warning ("Relay model catalog mismatch. Missing: " + ($missing -join ", ") + "; unexpected: " + ($unexpected -join ", "))
+            return
         }
+        $badContext = @($items | Where-Object {
+            $expected -contains [string]$_.id -and [int64]$_.context_window -ne 1050000
+        } | ForEach-Object { [string]$_.id })
+        if ($badContext.Count -gt 0) {
+            Write-Warning ("Relay capability context_window is not 1050000 for: " + ($badContext -join ", "))
+            return
+        }
+        Write-Step "Live relay capability contract matches six models with context_window 1050000"
     } catch {
-        Write-Warning "Praxis Relay is not reachable on localhost:5011 yet. The patch is installed; start the relay before Ouroboros."
+        Write-Warning "Praxis Relay is not reachable on localhost:8088 yet. The patch is installed; start the relay before Ouroboros."
+    } finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        if ($null -ne $response) { $response.Dispose() }
     }
 }
 
@@ -522,7 +546,7 @@ if ($bundleHash -ne $script:ExpectedBundleSha256 -or $bundleHash -ne ([string]$m
 }
 $patchHash = (Get-FileHash -LiteralPath $patchPath -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($patchHash -ne $script:ExpectedPatchSha256) {
-    throw "The patch artifact failed its SHA-256 integrity check."
+    throw "The unified patch artifact failed its SHA-256 integrity check."
 }
 
 $running = @(Get-Process -Name "Ouroboros" -ErrorAction SilentlyContinue)
@@ -558,12 +582,23 @@ $patchCommit = ""
 
 if ($alreadyPatched) {
     $marker = Get-Content -LiteralPath $markerPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($marker.id -ne "praxis-relay-openai-compatible" -or $marker.target_version -ne $script:ExpectedVersion) {
-        throw "An unknown Praxis Relay patch marker already exists: $markerPath"
+    if ($marker.id -ne "praxis-relay-openai-compatible" -or
+        $marker.target_version -ne $script:ExpectedVersion -or
+        $marker.base_url -ne "http://localhost:8088" -or
+        $marker.api_key -ne "auto" -or
+        $marker.chat_completions_path -ne "/chat/completions" -or
+        $marker.models_path -ne "/v1/models" -or
+        [int64]$marker.context_window -ne 1050000 -or
+        $marker.billing_mode -ne "subscription") {
+        throw "An unknown or incomplete Praxis Relay marker already exists: $markerPath"
     }
     $patchCommit = (Invoke-Git -Arguments @("log", "-1", "--format=%H", "--", $script:MarkerRelativePath)).Text.Trim()
     if (-not $patchCommit) { throw "The patch marker is not backed by a Git commit." }
-    Write-Step "Patch is already committed at $patchCommit; no empty commit will be created"
+    $patchParent = (Invoke-Git -Arguments @("rev-parse", "$patchCommit^" )).Text.Trim()
+    if ($patchParent -ne $script:ExpectedSourceSha) {
+        throw "The Praxis Relay marker is not the single unified commit based on Ouroboros 6.64.0."
+    }
+    Write-Step "The unified Praxis Relay patch is already committed at $patchCommit; no empty commit will be created"
     if (-not $SkipSettings) {
         $settingsState = Update-PraxisRelaySettings -ResolvedDataPath $resolvedDataPath -SelectedModel $Model
         Test-ConfiguredRoute -EmbeddedPython $embeddedPython -BundleRoot $bundleRoot -SelectedModel $Model
@@ -600,7 +635,7 @@ if ($alreadyPatched) {
         }
 
         $prePatchHead = (Invoke-Git -Arguments @("rev-parse", "HEAD")).Text.Trim()
-        Write-Step "Applying the signed mail patch; git am will create the required commit"
+        Write-Step "Applying the unified signed mail patch; git am will create exactly one required commit"
         Invoke-Git -Arguments @("am", "--3way", $patchPath) -Echo | Out-Null
         $patchCommit = (Invoke-Git -Arguments @("rev-parse", "HEAD")).Text.Trim()
         if (-not $patchCommit -or $patchCommit -eq $prePatchHead) {
@@ -610,6 +645,10 @@ if ($alreadyPatched) {
         $changedFiles = @((Invoke-Git -Arguments @("diff-tree", "--no-commit-id", "--name-only", "-r", $patchCommit)).Lines)
         if ($changedFiles -notcontains $script:MarkerRelativePath) {
             throw "The new commit does not contain the expected patch marker."
+        }
+        $createdCount = (Invoke-Git -Arguments @("rev-list", "--count", "$prePatchHead..$patchCommit")).Text.Trim()
+        if ($createdCount -ne "1") {
+            throw "The patch transaction created $createdCount commits instead of exactly one."
         }
 
         Invoke-PatchTests -EmbeddedPython $embeddedPython -BundleRoot $bundleRoot -ResolvedDataPath $resolvedDataPath
@@ -642,7 +681,7 @@ Write-Host "  Patch commit   : $patchCommit"
 Write-Host "  Current HEAD   : $finalHead"
 if ($backupBranch) { Write-Host "  Rollback branch: $backupBranch" }
 if ($settingsState -and $settingsState.BackupPath) { Write-Host "  Settings backup: $($settingsState.BackupPath)" }
-Write-Host "  Base URL       : http://localhost:5011"
+Write-Host "  Base URL       : http://localhost:8088"
 Write-Host "  API key        : auto"
 Write-Host "  Main model     : openai-compatible::$Model"
 Write-Host ""

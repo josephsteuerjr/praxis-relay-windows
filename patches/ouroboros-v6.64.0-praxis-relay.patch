@@ -1,23 +1,29 @@
-From e22f24b09c550aa768ca7e28f29460c7fa668516 Mon Sep 17 00:00:00 2001
-From: josephsteuerjr <josephsteuerjr@gmail.com>
-Date: Wed, 15 Jul 2026 06:54:45 +0400
-Subject: [PATCH] feat: add local Praxis Relay preset
+From c4f70440241f328e1542f08bb0fa81d8a46d8d23 Mon Sep 17 00:00:00 2001
+From: Ouroboros <ouroboros@local.mac>
+Date: Wed, 15 Jul 2026 09:01:34 +0400
+Subject: [PATCH] feat: add Praxis Relay Windows integration
 
 ---
  .ouroboros-patches/praxis-relay-v1.json |  15 ++++
+ .ouroboros-patches/praxis-relay-v2.json |  18 ++++
+ .ouroboros-patches/praxis-relay-v3.json |  19 +++++
  ouroboros/capability_evidence.py        |   5 +-
  ouroboros/gateway/models.py             |   4 +-
+ ouroboros/llm.py                        |  20 ++++-
  ouroboros/provider_models.py            |  25 ++++++
  ouroboros/settings_setup_contract.py    |  26 +++++-
  tests/test_capability_evidence.py       |  30 +++++++
+ tests/test_llm_provider_routing.py      |  21 ++++-
  tests/test_model_catalog_api.py         |  22 +++++
  tests/test_onboarding_wizard.py         |  41 ++++++++++
  tests/test_settings_ui_syntax.py        |  16 ++++
  web/modules/onboarding_wizard.js        | 104 +++++++++++++++++-------
  web/modules/settings.js                 |  37 +++++++++
  web/modules/settings_ui.js              |   6 ++
- 12 files changed, 296 insertions(+), 35 deletions(-)
+ 16 files changed, 370 insertions(+), 39 deletions(-)
  create mode 100644 .ouroboros-patches/praxis-relay-v1.json
+ create mode 100644 .ouroboros-patches/praxis-relay-v2.json
+ create mode 100644 .ouroboros-patches/praxis-relay-v3.json
 
 diff --git a/.ouroboros-patches/praxis-relay-v1.json b/.ouroboros-patches/praxis-relay-v1.json
 new file mode 100644
@@ -31,6 +37,55 @@ index 0000000..8924221
 +  "target_version": "6.64.0",
 +  "base_url": "http://localhost:5011",
 +  "api_key": "auto",
++  "models": [
++    "gpt-5.6-sol",
++    "gpt-5.6-terra",
++    "gpt-5.6-luna",
++    "gpt-5.5",
++    "gpt-5.4",
++    "gpt-5.4-mini"
++  ]
++}
+diff --git a/.ouroboros-patches/praxis-relay-v2.json b/.ouroboros-patches/praxis-relay-v2.json
+new file mode 100644
+index 0000000..d8f9020
+--- /dev/null
++++ b/.ouroboros-patches/praxis-relay-v2.json
+@@ -0,0 +1,18 @@
++{
++  "schema_version": 2,
++  "id": "praxis-relay-openai-compatible",
++  "target_version": "6.64.0",
++  "base_url": "http://localhost:8088",
++  "chat_completions_path": "/chat/completions",
++  "models_path": "/v1/models",
++  "api_key": "auto",
++  "context_window": 1050000,
++  "models": [
++    "gpt-5.6-sol",
++    "gpt-5.6-terra",
++    "gpt-5.6-luna",
++    "gpt-5.5",
++    "gpt-5.4",
++    "gpt-5.4-mini"
++  ]
++}
+diff --git a/.ouroboros-patches/praxis-relay-v3.json b/.ouroboros-patches/praxis-relay-v3.json
+new file mode 100644
+index 0000000..15373b3
+--- /dev/null
++++ b/.ouroboros-patches/praxis-relay-v3.json
+@@ -0,0 +1,19 @@
++{
++  "schema_version": 3,
++  "id": "praxis-relay-openai-compatible",
++  "target_version": "6.64.0",
++  "base_url": "http://localhost:8088",
++  "chat_completions_path": "/chat/completions",
++  "models_path": "/v1/models",
++  "api_key": "auto",
++  "context_window": 1050000,
++  "billing_mode": "subscription",
 +  "models": [
 +    "gpt-5.6-sol",
 +    "gpt-5.6-terra",
@@ -79,8 +134,60 @@ index 8a7df22..6731bb5 100644
          headers=headers,
      )
      response.raise_for_status()
+diff --git a/ouroboros/llm.py b/ouroboros/llm.py
+index 5648668..d65d54f 100644
+--- a/ouroboros/llm.py
++++ b/ouroboros/llm.py
+@@ -13,7 +13,13 @@ import time
+ import copy
+ from typing import Any, Dict, List, Optional, Set, Tuple
+ 
+-from ouroboros.provider_models import PROVIDER_PREFIXES, normalize_anthropic_model_id, normalize_model_identity
++from ouroboros.provider_models import (
++    PRAXIS_RELAY_API_KEY,
++    PRAXIS_RELAY_BASE_URL,
++    PROVIDER_PREFIXES,
++    normalize_anthropic_model_id,
++    normalize_model_identity,
++)
+ from ouroboros.usage_accounting import (
+     AttemptRequest,
+     UsageAccountingError,
+@@ -165,6 +171,7 @@ def _attempt_request(
+         provider=str(target.get("provider") or "unknown"),
+         prompt_tokens_estimate=max(0, prompt_chars // 4),
+         max_completion_tokens=int(payload.get("max_completion_tokens") or payload.get("max_tokens") or 0),
++        max_budget_usd=0.0 if target.get("subscription_backed") else None,
+         source=str(request_source or ""),
+     )
+ 
+@@ -1029,15 +1036,22 @@ class LLMClient:
+             compatible_base_url = (os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip()
+             legacy_base_url = (os.environ.get("OPENAI_BASE_URL", "") or "").strip()
+             legacy_key = (os.environ.get("OPENAI_API_KEY", "") or "").strip()
++            effective_base_url = compatible_base_url or legacy_base_url
++            effective_key = compatible_key or legacy_key
++            is_praxis_relay = (
++                effective_base_url.rstrip("/") == PRAXIS_RELAY_BASE_URL
++                and effective_key == PRAXIS_RELAY_API_KEY
++            )
+             return {
+                 "provider": provider,
+                 "resolved_model": resolved_model,
+                 "usage_model": usage_model,
+-                "api_key": compatible_key or legacy_key,
+-                "base_url": compatible_base_url or legacy_base_url,
++                "api_key": effective_key,
++                "base_url": effective_base_url,
+                 "default_headers": {},
+                 "supports_openrouter_extensions": False,
+                 "supports_generation_cost": False,
++                "subscription_backed": is_praxis_relay,
+             }
+ 
+         current_api_key = self._api_key_override
 diff --git a/ouroboros/provider_models.py b/ouroboros/provider_models.py
-index 9676ce0..1c76132 100644
+index 9676ce0..bd3bd46 100644
 --- a/ouroboros/provider_models.py
 +++ b/ouroboros/provider_models.py
 @@ -36,6 +36,31 @@ MODEL_PROVIDER_CREDENTIAL_KEYS: frozenset[str] = frozenset({
@@ -90,7 +197,7 @@ index 9676ce0..1c76132 100644
 +# The local Praxis Relay is an intentionally narrow preset of the existing
 +# OpenAI-compatible transport.  Keep these values together so onboarding,
 +# Settings, and model discovery cannot drift apart.
-+PRAXIS_RELAY_BASE_URL = "http://localhost:5011"
++PRAXIS_RELAY_BASE_URL = "http://localhost:8088"
 +PRAXIS_RELAY_API_KEY = "auto"
 +PRAXIS_RELAY_MODEL_IDS: tuple[str, ...] = (
 +    "gpt-5.6-sol",
@@ -183,7 +290,7 @@ index 05482e2..a3546e9 100644
  
      has_remote = any(
 diff --git a/tests/test_capability_evidence.py b/tests/test_capability_evidence.py
-index 17d5f7d..35ebea5 100644
+index 17d5f7d..c040fb6 100644
 --- a/tests/test_capability_evidence.py
 +++ b/tests/test_capability_evidence.py
 @@ -178,6 +178,36 @@ def test_openai_compatible_metadata_window_parses_max_model_len(monkeypatch):
@@ -198,7 +305,7 @@ index 17d5f7d..35ebea5 100644
 +            return None
 +
 +        def json(self):
-+            return {"data": [{"id": "gpt-5.6-terra", "context_window": 1_048_576}]}
++            return {"data": [{"id": "gpt-5.6-terra", "context_window": 1_050_000}]}
 +
 +    def _get(url, **kwargs):
 +        captured["url"] = url
@@ -210,21 +317,60 @@ index 17d5f7d..35ebea5 100644
 +
 +    win = ce._openai_compatible_metadata_window(
 +        "openai-compatible::gpt-5.6-terra",
-+        "http://localhost:5011/",
++        "http://localhost:8088/",
 +        allow_fetch=True,
 +        api_key="auto",
 +    )
 +
-+    assert win == 1_048_576
-+    assert captured["url"] == "http://localhost:5011/v1/models"
++    assert win == 1_050_000
++    assert captured["url"] == "http://localhost:8088/v1/models"
 +    assert captured["headers"] == {"Authorization": "Bearer auto"}
 +
 +
  def test_openai_compatible_metadata_window_fail_closed(monkeypatch):
      import httpx
  
+diff --git a/tests/test_llm_provider_routing.py b/tests/test_llm_provider_routing.py
+index 175e9b7..8ceb819 100644
+--- a/tests/test_llm_provider_routing.py
++++ b/tests/test_llm_provider_routing.py
+@@ -1,7 +1,7 @@
+ import pytest
+ import ouroboros.pricing as pricing_module
+ from unittest.mock import patch
+-from ouroboros.llm import LLMClient
++from ouroboros.llm import LLMClient, _attempt_request
+ 
+ 
+ def test_resolve_openai_target(monkeypatch):
+@@ -740,6 +740,25 @@ def test_resolve_openai_compatible_target_prefers_dedicated_credentials(monkeypa
+     assert target["api_key"] == "compat-key"
+     assert target["base_url"] == "https://compat.example/v1"
+     assert target["usage_model"] == "openai-compatible/meta-llama/compatible"
++    assert target["subscription_backed"] is False
++
++
++def test_praxis_relay_target_uses_subscription_reservation_only_for_exact_preset(monkeypatch):
++    monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "auto")
++    monkeypatch.setenv("OPENAI_COMPATIBLE_BASE_URL", "http://localhost:8088/")
++
++    target = LLMClient()._resolve_remote_target("openai-compatible::gpt-5.6-terra")
++    request = _attempt_request(target, {"model": "gpt-5.6-terra", "max_tokens": 32})
++
++    assert target["subscription_backed"] is True
++    assert request.max_budget_usd == 0.0
++
++    monkeypatch.setenv("OPENAI_COMPATIBLE_BASE_URL", "http://localhost:8089")
++    generic = LLMClient()._resolve_remote_target("openai-compatible::gpt-5.6-terra")
++    generic_request = _attempt_request(generic, {"model": "gpt-5.6-terra", "max_tokens": 32})
++
++    assert generic["subscription_backed"] is False
++    assert generic_request.max_budget_usd is None
+ 
+ 
+ def test_resolve_cloudru_target_uses_default_base_url(monkeypatch):
 diff --git a/tests/test_model_catalog_api.py b/tests/test_model_catalog_api.py
-index 56340a2..0f7b54a 100644
+index 56340a2..5e6915c 100644
 --- a/tests/test_model_catalog_api.py
 +++ b/tests/test_model_catalog_api.py
 @@ -152,6 +152,28 @@ def test_openai_compatible_model_fetch_omits_blank_bearer_header():
@@ -245,11 +391,11 @@ index 56340a2..0f7b54a 100644
 +        "openai-compatible",
 +        "OpenAI Compatible",
 +        "auto",
-+        "http://localhost:5011/",
++        "http://localhost:8088/",
 +    ))
 +
 +    assert models[0]["value"] == "openai-compatible::gpt-5.6-terra"
-+    assert captured["url"] == "http://localhost:5011/v1/models"
++    assert captured["url"] == "http://localhost:8088/v1/models"
 +    assert captured["headers"] == {"Authorization": "Bearer auto"}
 +
 +
@@ -257,7 +403,7 @@ index 56340a2..0f7b54a 100644
      monkeypatch.setattr(model_catalog_api, "load_settings", lambda: {})
      calls = []
 diff --git a/tests/test_onboarding_wizard.py b/tests/test_onboarding_wizard.py
-index bba64a1..f71d46f 100644
+index bba64a1..ef33980 100644
 --- a/tests/test_onboarding_wizard.py
 +++ b/tests/test_onboarding_wizard.py
 @@ -3,6 +3,12 @@ import pathlib
@@ -289,7 +435,7 @@ index bba64a1..f71d46f 100644
 +    prepared, error = prepare_onboarding_settings(payload, {})
 +
 +    assert error is None
-+    assert prepared["OPENAI_COMPATIBLE_BASE_URL"] == "http://localhost:5011"
++    assert prepared["OPENAI_COMPATIBLE_BASE_URL"] == "http://localhost:8088"
 +    assert prepared["OPENAI_COMPATIBLE_API_KEY"] == "auto"
 +    assert prepared["OUROBOROS_MODEL"] == "openai-compatible::gpt-5.6-terra"
 +
@@ -316,7 +462,7 @@ index bba64a1..f71d46f 100644
 +    source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
 +
 +    assert "data-compatible-preset" in source
-+    assert "Praxis Relay uses localhost:5011, key auto" in source
++    assert "Praxis Relay uses localhost:8088, key auto" in source
 +
 +
  def test_build_onboarding_html_contains_multistep_markers():
@@ -347,7 +493,7 @@ index cce5322..91a6acb 100644
 +    ):
 +        assert f"openai-compatible::{model_id}" in settings_source
 diff --git a/web/modules/onboarding_wizard.js b/web/modules/onboarding_wizard.js
-index 99856ef..ed9adb2 100644
+index 99856ef..86f2c31 100644
 --- a/web/modules/onboarding_wizard.js
 +++ b/web/modules/onboarding_wizard.js
 @@ -32,6 +32,7 @@
@@ -415,7 +561,7 @@ index 99856ef..ed9adb2 100644
 +                    <div class="selection-row">
 +                        ${presets.map(([id, preset]) => `<button class="selection-pill" data-compatible-preset="${escapeHtml(id)}" type="button">${escapeHtml(preset.label)}</button>`).join('')}
 +                    </div>
-+                    <p class="field-note">Praxis Relay uses localhost:5011, key auto, and its advertised GPT model set.</p>
++                    <p class="field-note">Praxis Relay uses localhost:8088, key auto, and its advertised GPT model set.</p>
 +                </div>
 +            `;
 +        }
@@ -562,7 +708,7 @@ index 7c7c739..c6f47ef 100644
          applyClaudeCodeStatus({
              installed: false,
 diff --git a/web/modules/settings_ui.js b/web/modules/settings_ui.js
-index e609e82..6adac9a 100644
+index e609e82..2e7e4b3 100644
 --- a/web/modules/settings_ui.js
 +++ b/web/modules/settings_ui.js
 @@ -80,6 +80,12 @@ const PROVIDER_CARDS = [
@@ -572,9 +718,12 @@ index e609e82..6adac9a 100644
 +        extra: `
 +            <div class="settings-toolbar">
 +                <button type="button" class="settings-ghost-btn" id="btn-praxis-relay-preset">Use Praxis Relay preset</button>
-+                <span class="settings-inline-status">localhost:5011 · key auto</span>
++                <span class="settings-inline-status">localhost:8088 · key auto</span>
 +            </div>
 +        `,
      },
      {
          id: 'cloudru', title: 'Cloud.ru Foundation Models', icon: '/static/providers/cloudru.svg', hint: 'Cloud.ru OpenAI-compatible runtime',
+-- 
+2.53.0.windows.3
+
