@@ -4,6 +4,8 @@ Windows PowerShell patcher for the released Ouroboros 6.64.0 one-folder build. I
 
 The repository history, original relay source, and v0.1.0 source tag are preserved. The default branch contains the focused patch package; current relay source is kept on its release source branch and tag.
 
+See [SPEC.md](SPEC.md) for the normative relay, model, settings, Git transaction, rollback, and repeated-installation contract.
+
 ## What the patch adds
 
 - Base URL: http://localhost:8088
