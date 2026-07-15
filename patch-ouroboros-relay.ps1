@@ -595,8 +595,9 @@ if ($alreadyPatched) {
     $patchCommit = (Invoke-Git -Arguments @("log", "-1", "--format=%H", "--", $script:MarkerRelativePath)).Text.Trim()
     if (-not $patchCommit) { throw "The patch marker is not backed by a Git commit." }
     $patchParent = (Invoke-Git -Arguments @("rev-parse", "$patchCommit^" )).Text.Trim()
-    if ($patchParent -ne $script:ExpectedSourceSha) {
-        throw "The Praxis Relay marker is not the single unified commit based on Ouroboros 6.64.0."
+    $patchParentIsReleaseDescendant = (Invoke-Git -Arguments @("merge-base", "--is-ancestor", $script:ExpectedSourceSha, $patchParent) -AllowFailure).ExitCode -eq 0
+    if (-not $patchParentIsReleaseDescendant) {
+        throw "The Praxis Relay marker is not a unified commit based on the Ouroboros 6.64.0 lineage."
     }
     Write-Step "The unified Praxis Relay patch is already committed at $patchCommit; no empty commit will be created"
     if (-not $SkipSettings) {
