@@ -2,7 +2,7 @@
 
 Windows PowerShell patcher for the released Ouroboros 6.64.0 one-folder build. It adds one dedicated Praxis Relay preset beside the existing generic OpenAI-compatible provider; the generic provider is not replaced.
 
-The repository history, original relay source, and v0.1.0 release are preserved. The default branch contains the focused patch package; current relay source is kept on its release source branch and tag.
+The repository history, original relay source, and v0.1.0 source tag are preserved. The default branch contains the focused patch package; current relay source is kept on its release source branch and tag.
 
 ## What the patch adds
 
