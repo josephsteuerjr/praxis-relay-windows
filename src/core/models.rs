@@ -22,6 +22,11 @@ pub const SUPPORTED_MODELS: &[&str] = &[
     "gpt-5.4-mini",
 ];
 
+/// Context ceiling exposed by the Codex API route used by this relay.
+/// Ouroboros consumes this field as capability evidence instead of guessing
+/// from a successful model-list response.
+pub const MODEL_CONTEXT_WINDOW: u32 = 1_050_000;
+
 /// The largest JSON body accepted by the Chat Completions endpoint.
 ///
 /// A 20 MiB image expands to roughly 26.7 MiB when base64 encoded, so 32 MiB
@@ -58,6 +63,7 @@ pub fn supported_model_list() -> ModelList {
                 object: "model".to_string(),
                 created,
                 owned_by: "chatgpt".to_string(),
+                context_window: MODEL_CONTEXT_WINDOW,
             })
             .collect(),
     }
@@ -448,6 +454,7 @@ pub struct Model {
     pub object: String,
     pub created: i64,
     pub owned_by: String,
+    pub context_window: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -540,6 +547,7 @@ mod tests {
         for m in &list.data {
             assert_eq!(m.object, "model");
             assert_eq!(m.owned_by, "chatgpt");
+            assert_eq!(m.context_window, MODEL_CONTEXT_WINDOW);
         }
     }
 

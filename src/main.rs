@@ -26,6 +26,9 @@ use core::models::{
 };
 use login::lib::CodexAuth;
 
+const RELAY_PORT: u16 = 8088;
+const RELAY_PORT_SCAN_END: u16 = 8097;
+
 // For CLI menu
 use std::io::{self, Write};
 use std::sync::Mutex;
@@ -85,6 +88,14 @@ async fn main() {
     info!("=== Starting Codex Proxy Server ==="); // Codex Proxy Server
     info!("Log directory: {}", logs_dir.display());
     info!("Timestamp: {}", chrono::Utc::now().to_rfc3339());
+
+    if std::env::args().skip(1).any(|arg| arg == "--serve") {
+        if let Err(e) = run_server().await {
+            error!("Failed to start server: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // Display CLI menu
     loop {
@@ -217,7 +228,7 @@ async fn run_server() -> anyhow::Result<()> {
         .with_state(app_state);
 
     // Configure server
-    let addr = SocketAddr::from(([127, 0, 0, 1], 5011));
+    let addr = SocketAddr::from(([127, 0, 0, 1], RELAY_PORT));
     info!("Server listening on {}", addr);
 
     // Start server and block until it exits
@@ -261,7 +272,7 @@ async fn refresh_token() -> anyhow::Result<()> {
 async fn close_all_servers() -> anyhow::Result<()> {
     println!("Closing all servers (system-wide)...");
     let mut closed = 0;
-    for port in 5011..=5020 {
+    for port in RELAY_PORT..=RELAY_PORT_SCAN_END {
         let pids = get_pids_for_port(port);
         for pid in pids {
             if kill_pid(pid) {
@@ -270,7 +281,10 @@ async fn close_all_servers() -> anyhow::Result<()> {
             }
         }
     }
-    println!("Closed {} running server(s) on ports 5011-5020.", closed);
+    println!(
+        "Closed {} running server(s) on ports {}-{}.",
+        closed, RELAY_PORT, RELAY_PORT_SCAN_END
+    );
     Ok(())
 }
 
@@ -382,16 +396,22 @@ fn is_port_in_use(port: u16) -> bool {
 }
 
 async fn list_running_servers() -> anyhow::Result<()> {
-    println!("Checking ports 5011-5020 for running servers...");
+    println!(
+        "Checking ports {}-{} for running servers...",
+        RELAY_PORT, RELAY_PORT_SCAN_END
+    );
     let mut found = false;
-    for port in 5011..=5020 {
+    for port in RELAY_PORT..=RELAY_PORT_SCAN_END {
         if is_port_in_use(port) {
             println!("Port {}: RUNNING", port);
             found = true;
         }
     }
     if !found {
-        println!("No running servers found on ports 5011-5020.");
+        println!(
+            "No running servers found on ports {}-{}.",
+            RELAY_PORT, RELAY_PORT_SCAN_END
+        );
     }
     Ok(())
 }
@@ -563,8 +583,51 @@ async fn chat_completions_handler(
             .into_response());
     }
 
+    let wants_stream = request.stream;
+    let requested_model = request.model.clone();
+
     // Process the chat completion
     match chat_completions::stream_chat_completions(&state.config, request).await {
+        Ok(mut response_stream) if !wants_stream => {
+            let mut events = Vec::new();
+            while let Some(result) = response_stream.recv().await {
+                match result {
+                    Ok(event) => events.push(event),
+                    Err(error) => {
+                        error!("Non-stream completion failed: {}", error);
+                        return Ok((
+                            StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "message": "Upstream completion stream failed",
+                                    "type": "upstream_error",
+                                    "code": "stream_error"
+                                }
+                            })),
+                        )
+                            .into_response());
+                    }
+                }
+            }
+
+            match chat_completions::aggregate_chat_completion(&requested_model, &events) {
+                Ok(completion) => Ok(Json(completion).into_response()),
+                Err(error) => {
+                    error!("Could not aggregate non-stream completion: {}", error);
+                    Ok((
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": {
+                                "message": "Upstream completion did not produce a usable response",
+                                "type": "upstream_error",
+                                "code": "invalid_upstream_response"
+                            }
+                        })),
+                    )
+                        .into_response())
+                }
+            }
+        }
         Ok(response_stream) => {
             info!("✅ Chat completion stream started successfully");
             // Convert the response stream to SSE

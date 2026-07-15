@@ -1,7 +1,7 @@
 # Praxis Relay for Windows
 
 `relay` is a standalone Rust/Axum service that exposes a small OpenAI-compatible API on
-`127.0.0.1:5011` for a local Praxis deployment.
+`127.0.0.1:8088` for a local Praxis deployment.
 
 This Windows-focused edition adds the Praxis model contract, multimodal input, hosted web
 search mapping, usage-limit reporting, a native Windows build, and a relay-owned OAuth store
@@ -24,6 +24,9 @@ It exposes:
 - `GET /v1/limits`
 - `GET /health`
 
+Each `/v1/models` entry advertises `context_window: 1050000`, matching the
+Codex API route used by the relay so clients can perform a real capability check.
+
 ## Run locally
 
 Install a current Rust toolchain, then run:
@@ -44,8 +47,10 @@ Build and run the native executable from PowerShell:
 ```powershell
 cargo build --release --locked
 Copy-Item .\target\release\codex-proxy-server.exe .\praxis-relay.exe
-.\praxis-relay.exe
+.\praxis-relay.exe --serve
 ```
+
+Run without `--serve` to use the interactive login and maintenance menu.
 
 The server itself does not require Python. Menu option `3` (interactive ChatGPT login) uses
 the first working Python 3 launcher among `python.exe`, `py.exe -3`, and `python3.exe`.

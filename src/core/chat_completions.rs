@@ -132,7 +132,12 @@ fn map_tools_for_responses(tools: &[Tool]) -> Vec<Value> {
                     "type": "function",
                     "name": function.name,
                     "parameters": function.parameters,
-                    "strict": function.strict.unwrap_or(true),
+                    // Chat Completions treats an omitted `strict` flag as false.
+                    // Do not silently strengthen ordinary client schemas: the
+                    // Responses API then requires `additionalProperties: false`
+                    // on every object, which rejects Ouroboros's valid non-strict
+                    // tool envelope before the model can answer.
+                    "strict": function.strict.unwrap_or(false),
                 });
                 if let Some(description) = &function.description {
                     mapped["description"] = json!(description);
@@ -631,6 +636,100 @@ fn parse_sse_event(event: &Value) -> Option<ResponseEvent> {
     })
 }
 
+pub fn aggregate_chat_completion(requested_model: &str, events: &[ResponseEvent]) -> Result<Value> {
+    if events.is_empty() {
+        anyhow::bail!("upstream stream ended without completion events");
+    }
+
+    let mut id = String::new();
+    let mut created = 0_i64;
+    let mut model = requested_model.to_string();
+    let mut content = String::new();
+    let mut tool_calls = Vec::new();
+    let mut seen_tool_calls = HashSet::new();
+    let mut finish_reason = None;
+
+    for event in events {
+        if id.is_empty() && !event.id.is_empty() {
+            id = event.id.clone();
+        }
+        if created == 0 && event.created > 0 {
+            created = event.created;
+        }
+        if !event.model.is_empty() && event.model != "gpt-4" {
+            model = event.model.clone();
+        }
+
+        for choice in &event.choices {
+            if let Some(fragment) = &choice.delta.content {
+                content.push_str(fragment);
+            }
+            if let Some(calls) = &choice.delta.tool_calls {
+                let values = calls
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_else(|| vec![calls.clone()]);
+                for mut call in values {
+                    if let Some(object) = call.as_object_mut() {
+                        object.remove("index");
+                    }
+                    let identity = call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| call.to_string());
+                    if seen_tool_calls.insert(identity) {
+                        tool_calls.push(call);
+                    }
+                }
+            }
+            if let Some(reason) = &choice.finish_reason {
+                if reason == "error" {
+                    anyhow::bail!("upstream stream reported an error completion");
+                }
+                finish_reason = Some(reason.clone());
+            }
+        }
+    }
+
+    if id.is_empty() {
+        id = format!("chatcmpl-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    }
+    if created == 0 {
+        created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+    }
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": if content.is_empty() { Value::Null } else { Value::String(content) },
+    });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(tool_calls);
+    }
+    let finish_reason = finish_reason.unwrap_or_else(|| {
+        if message.get("tool_calls").is_some() {
+            "tool_calls".to_string()
+        } else {
+            "stop".to_string()
+        }
+    });
+
+    Ok(json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }],
+    }))
+}
+
 fn safe_event_type(event: &Value) -> &str {
     event
         .get("type")
@@ -1038,6 +1137,37 @@ mod tests {
     }
 
     #[test]
+    fn omitted_function_strictness_stays_non_strict_for_chat_compatibility() {
+        let request: ChatRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-terra",
+            "messages": [{"role": "user", "content": "inspect"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "browse_page",
+                    "description": "Browse a page",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"url": {"type": "string"}}
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+
+        let payload = build_responses_payload(
+            &request,
+            "instructions".to_string(),
+            build_responses_input(&request.messages),
+        );
+
+        assert_eq!(payload["tools"][0]["strict"], false);
+        assert!(payload["tools"][0]["parameters"]
+            .get("additionalProperties")
+            .is_none());
+    }
+
+    #[test]
     fn codex_request_has_version_gated_user_agent() {
         let request = build_codex_request(
             &Client::new(),
@@ -1168,6 +1298,101 @@ mod tests {
         assert!(text.contains("https://source.example/11"));
         assert!(!text.contains("https://source.example/12"));
         assert!(!text.contains("ftp://unsafe.example"));
+    }
+
+    #[test]
+    fn non_stream_completion_aggregates_text_for_openai_sdk() {
+        let events = vec![
+            ResponseEvent {
+                id: "chatcmpl-test".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 123,
+                model: "gpt-5.6-terra".to_string(),
+                choices: vec![ResponseChoice {
+                    index: 0,
+                    delta: ResponseDelta {
+                        role: Some("assistant".to_string()),
+                        content: Some("O".to_string()),
+                        tool_calls: None,
+                    },
+                    finish_reason: None,
+                }],
+            },
+            ResponseEvent {
+                id: "chatcmpl-test".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 123,
+                model: "gpt-5.6-terra".to_string(),
+                choices: vec![ResponseChoice {
+                    index: 0,
+                    delta: ResponseDelta {
+                        role: None,
+                        content: Some("K".to_string()),
+                        tool_calls: None,
+                    },
+                    finish_reason: Some("stop".to_string()),
+                }],
+            },
+        ];
+
+        let completion = aggregate_chat_completion("gpt-5.6-terra", &events).unwrap();
+        assert_eq!(completion["object"], "chat.completion");
+        assert_eq!(completion["model"], "gpt-5.6-terra");
+        assert_eq!(completion["choices"][0]["message"]["content"], "OK");
+        assert_eq!(completion["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn non_stream_completion_preserves_tool_calls() {
+        let events = vec![ResponseEvent {
+            id: "chatcmpl-tool".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 456,
+            model: "gpt-5.6-terra".to_string(),
+            choices: vec![ResponseChoice {
+                index: 0,
+                delta: ResponseDelta {
+                    role: Some("assistant".to_string()),
+                    content: None,
+                    tool_calls: Some(json!([{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}
+                    }])),
+                },
+                finish_reason: Some("tool_calls".to_string()),
+            }],
+        }];
+
+        let completion = aggregate_chat_completion("gpt-5.6-terra", &events).unwrap();
+        let call = &completion["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(completion["choices"][0]["message"]["content"], Value::Null);
+        assert_eq!(completion["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(call["id"], "call_1");
+        assert_eq!(call["function"]["name"], "read_file");
+        assert!(call.get("index").is_none());
+    }
+
+    #[test]
+    fn non_stream_completion_rejects_error_event() {
+        let events = vec![ResponseEvent {
+            id: "chatcmpl-error".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 789,
+            model: "gpt-5.6-terra".to_string(),
+            choices: vec![ResponseChoice {
+                index: 0,
+                delta: ResponseDelta {
+                    role: Some("assistant".to_string()),
+                    content: Some("upstream failed".to_string()),
+                    tool_calls: None,
+                },
+                finish_reason: Some("error".to_string()),
+            }],
+        }];
+
+        assert!(aggregate_chat_completion("gpt-5.6-terra", &events).is_err());
     }
 
     #[test]

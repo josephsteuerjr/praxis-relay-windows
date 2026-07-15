@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Multi-stage build. Binary hardcodes bind to 127.0.0.1:5011 -> run with network_mode: host.
+# Multi-stage build. Binary hardcodes bind to 127.0.0.1:8088 -> run with network_mode: host.
 # Runtime binary is renamed to a neutral name so the process doesn't advertise its purpose.
 FROM rust:1-bookworm AS builder
 ENV CARGO_TERM_COLOR=always
@@ -22,6 +22,6 @@ WORKDIR /app
 # Rename on copy -> process name is neutral.
 COPY --from=builder /usr/src/codex/target/release/codex-proxy-server /usr/local/bin/relay
 ENV HOME=/root RUST_LOG=info RELAY_LOG_DIR=/app/logs
-EXPOSE 5011
+EXPOSE 8088
 # main() shows an interactive menu; feed "1" (Run server) on stdin to auto-start.
 CMD ["sh", "-c", "echo 1 | relay"]
