@@ -1,0 +1,580 @@
+From e22f24b09c550aa768ca7e28f29460c7fa668516 Mon Sep 17 00:00:00 2001
+From: josephsteuerjr <josephsteuerjr@gmail.com>
+Date: Wed, 15 Jul 2026 06:54:45 +0400
+Subject: [PATCH] feat: add local Praxis Relay preset
+
+---
+ .ouroboros-patches/praxis-relay-v1.json |  15 ++++
+ ouroboros/capability_evidence.py        |   5 +-
+ ouroboros/gateway/models.py             |   4 +-
+ ouroboros/provider_models.py            |  25 ++++++
+ ouroboros/settings_setup_contract.py    |  26 +++++-
+ tests/test_capability_evidence.py       |  30 +++++++
+ tests/test_model_catalog_api.py         |  22 +++++
+ tests/test_onboarding_wizard.py         |  41 ++++++++++
+ tests/test_settings_ui_syntax.py        |  16 ++++
+ web/modules/onboarding_wizard.js        | 104 +++++++++++++++++-------
+ web/modules/settings.js                 |  37 +++++++++
+ web/modules/settings_ui.js              |   6 ++
+ 12 files changed, 296 insertions(+), 35 deletions(-)
+ create mode 100644 .ouroboros-patches/praxis-relay-v1.json
+
+diff --git a/.ouroboros-patches/praxis-relay-v1.json b/.ouroboros-patches/praxis-relay-v1.json
+new file mode 100644
+index 0000000..8924221
+--- /dev/null
++++ b/.ouroboros-patches/praxis-relay-v1.json
+@@ -0,0 +1,15 @@
++{
++  "schema_version": 1,
++  "id": "praxis-relay-openai-compatible",
++  "target_version": "6.64.0",
++  "base_url": "http://localhost:5011",
++  "api_key": "auto",
++  "models": [
++    "gpt-5.6-sol",
++    "gpt-5.6-terra",
++    "gpt-5.6-luna",
++    "gpt-5.5",
++    "gpt-5.4",
++    "gpt-5.4-mini"
++  ]
++}
+diff --git a/ouroboros/capability_evidence.py b/ouroboros/capability_evidence.py
+index c0f5006..93e67dd 100644
+--- a/ouroboros/capability_evidence.py
++++ b/ouroboros/capability_evidence.py
+@@ -379,7 +379,10 @@ def _openai_compatible_metadata_window(
+             from ouroboros.config import load_settings
+             api_key = str((load_settings() or {}).get("OPENAI_COMPATIBLE_API_KEY") or "")
+         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+-        resp = httpx.get(str(base_url).rstrip("/") + "/models", headers=headers, timeout=5.0)
++        api_root = str(base_url).rstrip("/")
++        from ouroboros.provider_models import PRAXIS_RELAY_BASE_URL
++        models_path = "/v1/models" if api_root == PRAXIS_RELAY_BASE_URL else "/models"
++        resp = httpx.get(api_root + models_path, headers=headers, timeout=5.0)
+         resp.raise_for_status()
+         payload = resp.json()
+         items = payload.get("data") if isinstance(payload, dict) else payload
+diff --git a/ouroboros/gateway/models.py b/ouroboros/gateway/models.py
+index 8a7df22..6731bb5 100644
+--- a/ouroboros/gateway/models.py
++++ b/ouroboros/gateway/models.py
+@@ -13,6 +13,7 @@ from starlette.responses import JSONResponse
+ 
+ from ouroboros.config import load_settings
+ from ouroboros.gateway._helpers import json_error, json_exception
++from ouroboros.provider_models import PRAXIS_RELAY_BASE_URL
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -102,8 +103,9 @@ async def _fetch_openai_compatible_model_catalog(
+         return []
+ 
+     headers = {"Authorization": f"Bearer {api_key}"} if str(api_key or "").strip() else None
++    models_path = "/v1/models" if api_root == PRAXIS_RELAY_BASE_URL else "/models"
+     response = await client.get(
+-        f"{api_root}/models",
++        f"{api_root}{models_path}",
+         headers=headers,
+     )
+     response.raise_for_status()
+diff --git a/ouroboros/provider_models.py b/ouroboros/provider_models.py
+index 9676ce0..1c76132 100644
+--- a/ouroboros/provider_models.py
++++ b/ouroboros/provider_models.py
+@@ -36,6 +36,31 @@ MODEL_PROVIDER_CREDENTIAL_KEYS: frozenset[str] = frozenset({
+     "GIGACHAT_PASSWORD",
+ })
+ 
++# The local Praxis Relay is an intentionally narrow preset of the existing
++# OpenAI-compatible transport.  Keep these values together so onboarding,
++# Settings, and model discovery cannot drift apart.
++PRAXIS_RELAY_BASE_URL = "http://localhost:5011"
++PRAXIS_RELAY_API_KEY = "auto"
++PRAXIS_RELAY_MODEL_IDS: tuple[str, ...] = (
++    "gpt-5.6-sol",
++    "gpt-5.6-terra",
++    "gpt-5.6-luna",
++    "gpt-5.5",
++    "gpt-5.4",
++    "gpt-5.4-mini",
++)
++PRAXIS_RELAY_MODELS: tuple[str, ...] = tuple(
++    f"openai-compatible::{model_id}" for model_id in PRAXIS_RELAY_MODEL_IDS
++)
++PRAXIS_RELAY_DEFAULTS = {
++    "main": "openai-compatible::gpt-5.6-terra",
++    "heavy": "openai-compatible::gpt-5.6-terra",
++    "light": "openai-compatible::gpt-5.4-mini",
++    "vision": "openai-compatible::gpt-5.6-terra",
++    "consciousness": "openai-compatible::gpt-5.6-terra",
++    "fallback": "openai-compatible::gpt-5.4-mini",
++}
++
+ 
+ def provider_for_model(model: str) -> str:
+     """Return the execution provider for a model id (``local`` for local lanes)."""
+diff --git a/ouroboros/settings_setup_contract.py b/ouroboros/settings_setup_contract.py
+index 05482e2..a3546e9 100644
+--- a/ouroboros/settings_setup_contract.py
++++ b/ouroboros/settings_setup_contract.py
+@@ -10,6 +10,10 @@ from ouroboros.provider_models import (
+     ANTHROPIC_DIRECT_DEFAULTS,
+     CLOUDRU_DIRECT_DEFAULTS,
+     OPENAI_DIRECT_DEFAULTS,
++    PRAXIS_RELAY_API_KEY,
++    PRAXIS_RELAY_BASE_URL,
++    PRAXIS_RELAY_DEFAULTS,
++    PRAXIS_RELAY_MODELS,
+ )
+ 
+ 
+@@ -42,6 +46,16 @@ for _profile_defaults in _MODEL_DEFAULTS.values():
+     _profile_defaults.setdefault("consciousness", "")
+     _profile_defaults.setdefault("vision", "")
+ 
++_COMPATIBLE_PRESETS = {
++    "praxis-relay": {
++        "label": "Praxis Relay (local)",
++        "baseUrl": PRAXIS_RELAY_BASE_URL,
++        "apiKey": PRAXIS_RELAY_API_KEY,
++        "models": list(PRAXIS_RELAY_MODELS),
++        "defaults": dict(PRAXIS_RELAY_DEFAULTS),
++    },
++}
++
+ _STEPS = _rows(("id", "title", "railCopy", "copy", "footer"), (
+     ("providers", "Add your access", "Keys + local", "Fill at least one remote key or a local model source. The next step adapts to what you configured here.", "Paste only what you already have. OpenRouter, direct provider keys, and an optional local model can coexist."),
+     ("models", "Choose models", "model slots", "Review the visible model defaults derived from your current setup, then edit anything you want before launch.", "Plain openai/... or anthropic/... remains router-style. Direct values use openai::... and anthropic::...."),
+@@ -131,7 +145,7 @@ _LOCAL_PRESETS: Dict[str, Dict[str, Any]] = {
+     "qwen3-32b": {"label": "Qwen3-32B Instruct Q4_K_M", "source": "Qwen/Qwen3-32B-GGUF", "filename": "Qwen3-32B-Q4_K_M.gguf", "contextLength": 32768, "chatFormat": ""},
+ }
+ 
+-_MODEL_SUGGESTIONS = list(dict.fromkeys(("google/gemini-3.5-flash", "anthropic/claude-fable-5", "anthropic::claude-fable-5", "anthropic/claude-sonnet-4.6", "anthropic/claude-opus-4.8", "anthropic/claude-opus-4.7", "anthropic/claude-opus-4.6", "anthropic::claude-opus-4-8", "anthropic::claude-opus-4-7", "anthropic::claude-opus-4-6", "anthropic::claude-sonnet-4-6", "openai/gpt-5.5", "openai::gpt-5.5", "openai::gpt-5.4-mini", "openai-compatible::meta-llama/compatible", "cloudru::zai-org/GLM-4.7")))
++_MODEL_SUGGESTIONS = list(dict.fromkeys(("google/gemini-3.5-flash", "anthropic/claude-fable-5", "anthropic::claude-fable-5", "anthropic/claude-sonnet-4.6", "anthropic/claude-opus-4.8", "anthropic/claude-opus-4.7", "anthropic/claude-opus-4.6", "anthropic::claude-opus-4-8", "anthropic::claude-opus-4-7", "anthropic::claude-opus-4-6", "anthropic::claude-sonnet-4-6", "openai/gpt-5.5", "openai::gpt-5.5", "openai::gpt-5.4-mini", "openai-compatible::meta-llama/compatible", *PRAXIS_RELAY_MODELS, "cloudru::zai-org/GLM-4.7")))
+ 
+ 
+ def _string(value: Any) -> str:
+@@ -215,6 +229,7 @@ def build_setup_contract(host_mode: str = "desktop") -> dict:
+         "steps": [dict(item) for item in _STEPS],
+         "providerFields": [dict(item) for item in _PROVIDER_FIELDS],
+         "providerProfiles": {key: {"label": spec[0], "providerCopy": spec[1], "modelCopy": spec[2]} for key, spec in _PROFILE_SPECS.items()},
++        "compatiblePresets": {key: dict(value) for key, value in _COMPATIBLE_PRESETS.items()},
+         "modelSlots": [dict(item) for item in _MODEL_SLOTS],
+         "reviewModes": [dict(item) for item in _REVIEW_MODES],
+         "runtimeModes": [dict(item) for item in _RUNTIME_MODES],
+@@ -289,9 +304,16 @@ def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, st
+     raw_runtime_mode = _string(data.get("OUROBOROS_RUNTIME_MODE"))
+     runtime_mode = raw_runtime_mode.lower() if raw_runtime_mode else _string(current_settings.get("OUROBOROS_RUNTIME_MODE")) or str(SETTINGS_DEFAULTS["OUROBOROS_RUNTIME_MODE"])
+ 
++    compatible_preset = next((
++        preset for preset in _COMPATIBLE_PRESETS.values()
++        if keys["OPENAI_COMPATIBLE_BASE_URL"].rstrip("/") == preset["baseUrl"]
++        and keys["OPENAI_COMPATIBLE_API_KEY"] == preset["apiKey"]
++    ), None)
++
+     for field in _PROVIDER_FIELDS:
+         value = keys[field["settingKey"]]
+-        if value and field.get("inputType") != "url" and len(value) < 10:
++        preset_key = compatible_preset and field["settingKey"] == "OPENAI_COMPATIBLE_API_KEY"
++        if value and field.get("inputType") != "url" and len(value) < 10 and not preset_key:
+             return {}, f"{field['label'].replace(' API Key', '')} API key looks too short."
+ 
+     has_remote = any(
+diff --git a/tests/test_capability_evidence.py b/tests/test_capability_evidence.py
+index 17d5f7d..35ebea5 100644
+--- a/tests/test_capability_evidence.py
++++ b/tests/test_capability_evidence.py
+@@ -178,6 +178,36 @@ def test_openai_compatible_metadata_window_parses_max_model_len(monkeypatch):
+     assert win_prefixed == 1048576
+ 
+ 
++def test_praxis_relay_capability_metadata_uses_v1_models_and_auto_key(monkeypatch):
++    captured = {}
++
++    class _Resp:
++        def raise_for_status(self):
++            return None
++
++        def json(self):
++            return {"data": [{"id": "gpt-5.6-terra", "context_window": 1_048_576}]}
++
++    def _get(url, **kwargs):
++        captured["url"] = url
++        captured["headers"] = kwargs.get("headers")
++        return _Resp()
++
++    import httpx
++    monkeypatch.setattr(httpx, "get", _get)
++
++    win = ce._openai_compatible_metadata_window(
++        "openai-compatible::gpt-5.6-terra",
++        "http://localhost:5011/",
++        allow_fetch=True,
++        api_key="auto",
++    )
++
++    assert win == 1_048_576
++    assert captured["url"] == "http://localhost:5011/v1/models"
++    assert captured["headers"] == {"Authorization": "Bearer auto"}
++
++
+ def test_openai_compatible_metadata_window_fail_closed(monkeypatch):
+     import httpx
+ 
+diff --git a/tests/test_model_catalog_api.py b/tests/test_model_catalog_api.py
+index 56340a2..0f7b54a 100644
+--- a/tests/test_model_catalog_api.py
++++ b/tests/test_model_catalog_api.py
+@@ -152,6 +152,28 @@ def test_openai_compatible_model_fetch_omits_blank_bearer_header():
+     assert captured["headers"] is None
+ 
+ 
++def test_praxis_relay_model_fetch_uses_its_v1_models_route():
++    captured = {}
++
++    class Client:
++        async def get(self, url, **kwargs):
++            captured["url"] = url
++            captured["headers"] = kwargs.get("headers")
++            return _Response({"data": [{"id": "gpt-5.6-terra"}]})
++
++    models = asyncio.run(model_catalog_api._fetch_openai_compatible_model_catalog(
++        Client(),
++        "openai-compatible",
++        "OpenAI Compatible",
++        "auto",
++        "http://localhost:5011/",
++    ))
++
++    assert models[0]["value"] == "openai-compatible::gpt-5.6-terra"
++    assert captured["url"] == "http://localhost:5011/v1/models"
++    assert captured["headers"] == {"Authorization": "Bearer auto"}
++
++
+ def test_model_catalog_runs_provider_loaders_as_native_async(monkeypatch):
+     monkeypatch.setattr(model_catalog_api, "load_settings", lambda: {})
+     calls = []
+diff --git a/tests/test_onboarding_wizard.py b/tests/test_onboarding_wizard.py
+index bba64a1..f71d46f 100644
+--- a/tests/test_onboarding_wizard.py
++++ b/tests/test_onboarding_wizard.py
+@@ -3,6 +3,12 @@ import pathlib
+ import pytest
+ 
+ from ouroboros.onboarding_wizard import build_onboarding_html, prepare_onboarding_settings
++from ouroboros.provider_models import (
++    PRAXIS_RELAY_API_KEY,
++    PRAXIS_RELAY_BASE_URL,
++    PRAXIS_RELAY_DEFAULTS,
++    PRAXIS_RELAY_MODELS,
++)
+ from ouroboros.settings_setup_contract import build_setup_bootstrap, build_setup_contract
+ 
+ 
+@@ -210,6 +216,34 @@ def test_prepare_onboarding_settings_accepts_openai_compatible_setup():
+     assert prepared["OUROBOROS_MODEL"] == "openai-compatible::llama3"
+ 
+ 
++def test_prepare_onboarding_settings_accepts_praxis_relay_auto_key():
++    payload = _base_payload()
++    payload["OPENAI_COMPATIBLE_BASE_URL"] = PRAXIS_RELAY_BASE_URL
++    payload["OPENAI_COMPATIBLE_API_KEY"] = PRAXIS_RELAY_API_KEY
++    payload["OUROBOROS_MODEL"] = PRAXIS_RELAY_DEFAULTS["main"]
++    payload["OUROBOROS_MODEL_HEAVY"] = PRAXIS_RELAY_DEFAULTS["heavy"]
++    payload["OUROBOROS_MODEL_LIGHT"] = PRAXIS_RELAY_DEFAULTS["light"]
++    payload["OUROBOROS_MODEL_FALLBACKS"] = PRAXIS_RELAY_DEFAULTS["fallback"]
++
++    prepared, error = prepare_onboarding_settings(payload, {})
++
++    assert error is None
++    assert prepared["OPENAI_COMPATIBLE_BASE_URL"] == "http://localhost:5011"
++    assert prepared["OPENAI_COMPATIBLE_API_KEY"] == "auto"
++    assert prepared["OUROBOROS_MODEL"] == "openai-compatible::gpt-5.6-terra"
++
++
++def test_setup_contract_exposes_only_the_praxis_relay_compatible_preset():
++    contract = build_setup_contract()
++
++    assert set(contract["compatiblePresets"]) == {"praxis-relay"}
++    preset = contract["compatiblePresets"]["praxis-relay"]
++    assert preset["baseUrl"] == PRAXIS_RELAY_BASE_URL
++    assert preset["apiKey"] == PRAXIS_RELAY_API_KEY
++    assert tuple(preset["models"]) == PRAXIS_RELAY_MODELS
++    assert preset["defaults"] == PRAXIS_RELAY_DEFAULTS
++
++
+ def test_prepare_onboarding_settings_accepts_empty_heavy_and_light():
+     """Role-model (v6.39): only Main is required; empty Heavy/Light fall back to Main, so
+     the owner is not forced to fill every slot (mirrors the relaxed JS validateModelsStep
+@@ -254,6 +288,13 @@ def test_onboarding_frontend_uses_base_url_first_compatible_validation():
+     assert "const hasRemote = keyValues.some(([, value]) => value);" not in source
+ 
+ 
++def test_onboarding_frontend_exposes_praxis_relay_preset():
++    source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
++
++    assert "data-compatible-preset" in source
++    assert "Praxis Relay uses localhost:5011, key auto" in source
++
++
+ def test_build_onboarding_html_contains_multistep_markers():
+     html = build_onboarding_html({})
+ 
+diff --git a/tests/test_settings_ui_syntax.py b/tests/test_settings_ui_syntax.py
+index cce5322..91a6acb 100644
+--- a/tests/test_settings_ui_syntax.py
++++ b/tests/test_settings_ui_syntax.py
+@@ -119,3 +119,19 @@ def test_render_settings_page_no_bare_bracket_backtick():
+         "This is the v4.39.2 regression pattern. Lines in body: "
+         + str([body[:m.start()].count('\n') + 1 for m in matches])
+     )
++
++
++def test_settings_exposes_praxis_relay_preset_and_models():
++    ui_source = SETTINGS_UI_JS.read_text(encoding="utf-8")
++    settings_source = (SETTINGS_UI_JS.parent / "settings.js").read_text(encoding="utf-8")
++
++    assert 'id="btn-praxis-relay-preset"' in ui_source
++    for model_id in (
++        "gpt-5.6-sol",
++        "gpt-5.6-terra",
++        "gpt-5.6-luna",
++        "gpt-5.5",
++        "gpt-5.4",
++        "gpt-5.4-mini",
++    ):
++        assert f"openai-compatible::{model_id}" in settings_source
+diff --git a/web/modules/onboarding_wizard.js b/web/modules/onboarding_wizard.js
+index 99856ef..ed9adb2 100644
+--- a/web/modules/onboarding_wizard.js
++++ b/web/modules/onboarding_wizard.js
+@@ -32,6 +32,7 @@
+         ];
+         const MODEL_DEFAULTS = bootstrap.modelDefaults || {};
+         const LOCAL_PRESETS = bootstrap.localPresets || {};
++        const COMPATIBLE_PRESETS = SETUP_CONTRACT.compatiblePresets || {};
+         const MODEL_SUGGESTIONS = bootstrap.modelSuggestions || [];
+         const INITIAL_STATE = bootstrap.initialState || {};
+         const root = document.getElementById('root');
+@@ -201,19 +202,30 @@
+         state.modelsDirty = false;
+     }
+ 
+-        function validateProvidersStep() {
+-            const keyValues = PROVIDER_FIELDS.map((field) => [field, trim(state[field.stateKey])]);
+-            const localSource = trim(state.localSource);
+-            const localFilename = trim(state.localFilename);
+-            const shortKey = keyValues.find(([field, value]) => value && (field.inputType || 'password') === 'password' && value.length < 10);
+-            if (shortKey) return `${shortKey[0].label.replace(' API Key', '')} API key looks too short.`;
+-            const hasRemote = keyValues.some(([field, value]) => value && field.settingKey !== 'OPENAI_COMPATIBLE_API_KEY');
+-            if (!hasRemote && !localSource) {
+-                return 'Enter at least one remote key or a local model source before continuing.';
+-            }
+-            if (localSource && !hasRemote && trim(state.localRoutingMode) === 'cloud') {
+-                return 'Local-only setups must route at least one model to the local runtime.';
+-            }
++    function compatiblePresetMatches(field, value) {
++        if (field.settingKey !== 'OPENAI_COMPATIBLE_API_KEY') return false;
++        return Object.values(COMPATIBLE_PRESETS).some((preset) => (
++            trim(state.compatibleBaseUrl).replace(/\/+$/, '') === trim(preset.baseUrl).replace(/\/+$/, '')
++            && value === trim(preset.apiKey)
++        ));
++    }
++
++    function validateProvidersStep() {
++        const keyValues = PROVIDER_FIELDS.map((field) => [field, trim(state[field.stateKey])]);
++        const localSource = trim(state.localSource);
++        const localFilename = trim(state.localFilename);
++        const shortKey = keyValues.find(([field, value]) => value
++            && (field.inputType || 'password') === 'password'
++            && value.length < 10
++            && !compatiblePresetMatches(field, value));
++        if (shortKey) return `${shortKey[0].label.replace(' API Key', '')} API key looks too short.`;
++        const hasRemote = keyValues.some(([field, value]) => value && field.settingKey !== 'OPENAI_COMPATIBLE_API_KEY');
++        if (!hasRemote && !localSource) {
++            return 'Enter at least one remote key or a local model source before continuing.';
++        }
++        if (localSource && !hasRemote && trim(state.localRoutingMode) === 'cloud') {
++            return 'Local-only setups must route at least one model to the local runtime.';
++        }
+         if (localSource && localSource.includes('/') && !isLocalFilesystemSource(localSource) && !localFilename) {
+             return 'Local HuggingFace sources need a GGUF filename.';
+         }
+@@ -520,6 +532,20 @@
+             `;
+         }
+ 
++        function renderCompatiblePresets() {
++            const presets = Object.entries(COMPATIBLE_PRESETS);
++            if (!presets.length) return '';
++            return `
++                <div class="panel-card">
++                    <h3>OpenAI-compatible presets</h3>
++                    <div class="selection-row">
++                        ${presets.map(([id, preset]) => `<button class="selection-pill" data-compatible-preset="${escapeHtml(id)}" type="button">${escapeHtml(preset.label)}</button>`).join('')}
++                    </div>
++                    <p class="field-note">Praxis Relay uses localhost:5011, key auto, and its advertised GPT model set.</p>
++                </div>
++            `;
++        }
++
+         function localInputField([id, stateKey, label, placeholder, note, className, type = 'text', min = '', step = '']) {
+             const clear = ['local-source', 'local-filename', 'local-chat-format'].includes(id)
+                 ? `<button class="field-clear" data-clear="${id}" type="button">Clear</button>`
+@@ -548,6 +574,7 @@
+                     <h3>Keys first, routing second</h3>
+                     <p>${escapeHtml(PROVIDER_PROFILES[selectedProfile]?.providerCopy || '')}</p>
+                 </div>
++                ${renderCompatiblePresets()}
+                 <div class="field-grid">
+                     ${PROVIDER_FIELDS.map((field) => providerKeyField({
+                         ...field,
+@@ -824,8 +851,8 @@
+                 state.localSourceOpen = details.open;
+             });
+         }
+-            const localPreset = document.getElementById('local-preset');
+-            const localSource = document.getElementById('local-source');
++        const localPreset = document.getElementById('local-preset');
++        const localSource = document.getElementById('local-source');
+         const localFilename = document.getElementById('local-filename');
+         const localContext = document.getElementById('local-context');
+         const localGpuLayers = document.getElementById('local-gpu-layers');
+@@ -840,25 +867,40 @@
+             });
+         }
+ 
+-            PROVIDER_FIELDS.forEach((field) => {
+-                const input = document.getElementById(field.id);
+-                if (field.settingKey !== 'ANTHROPIC_API_KEY') {
+-                    bindStateInput(input, field.stateKey);
+-                    return;
++        PROVIDER_FIELDS.forEach((field) => {
++            const input = document.getElementById(field.id);
++            if (field.settingKey !== 'ANTHROPIC_API_KEY') {
++                bindStateInput(input, field.stateKey);
++                return;
++            }
++            if (!input) return;
++            input.addEventListener('input', () => {
++                const wasConfigured = hasAnthropicKeyConfigured();
++                state[field.stateKey] = input.value;
++                if (!wasConfigured && hasAnthropicKeyConfigured()) {
++                    state.claudeCliDismissed = false;
++                    startClaudeCliStatusPolling();
++                    updateClaudeCliStatus();
+                 }
+-                if (!input) return;
+-                input.addEventListener('input', () => {
+-                    const wasConfigured = hasAnthropicKeyConfigured();
+-                    state[field.stateKey] = input.value;
+-                    if (!wasConfigured && hasAnthropicKeyConfigured()) {
+-                        state.claudeCliDismissed = false;
+-                        startClaudeCliStatusPolling();
+-                        updateClaudeCliStatus();
+-                    }
+-                    syncClaudeCliVisibility();
+-                    markStepEdited();
++                syncClaudeCliVisibility();
++                markStepEdited();
++            });
++        });
++        root.querySelectorAll('[data-compatible-preset]').forEach((button) => {
++            button.addEventListener('click', () => {
++                const preset = COMPATIBLE_PRESETS[button.getAttribute('data-compatible-preset')];
++                if (!preset) return;
++                state.compatibleBaseUrl = preset.baseUrl || '';
++                state.compatibleApiKey = preset.apiKey || '';
++                const defaults = preset.defaults || {};
++                MODEL_SLOTS.forEach((slot) => {
++                    if (Object.prototype.hasOwnProperty.call(defaults, slot.slot)) state[slot.stateKey] = defaults[slot.slot];
+                 });
++                state.modelsDirty = true;
++                state.error = '';
++                render();
+             });
++        });
+         if (localPreset) localPreset.addEventListener('change', () => { applyPresetSelection(localPreset.value); state.error = ''; render(); });
+         bindStateInput(localSource, 'localSource', () => {
+             state.localPreset = detectLocalPresetSelection();
+diff --git a/web/modules/settings.js b/web/modules/settings.js
+index 7c7c739..c6f47ef 100644
+--- a/web/modules/settings.js
++++ b/web/modules/settings.js
+@@ -41,6 +41,10 @@ function setupModelSlots() {
+     return Array.isArray(setupContract.modelSlots) ? setupContract.modelSlots : [];
+ }
+ 
++function compatiblePreset(id) {
++    return setupContract.compatiblePresets?.[id] || null;
++}
++
+ function byId(id) {
+     return document.getElementById(id);
+ }
+@@ -274,6 +278,12 @@ const SETTINGS_FALLBACK_MODELS = [
+     'anthropic::claude-sonnet-4-6',
+     'openai::gpt-5.5',
+     'openai::gpt-5.4-mini',
++    'openai-compatible::gpt-5.6-sol',
++    'openai-compatible::gpt-5.6-terra',
++    'openai-compatible::gpt-5.6-luna',
++    'openai-compatible::gpt-5.5',
++    'openai-compatible::gpt-5.4',
++    'openai-compatible::gpt-5.4-mini',
+     'openai/gpt-5.5',
+     'anthropic/claude-opus-4.6',
+ ];
+@@ -972,6 +982,33 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
+         }
+     });
+ 
++    byId('btn-praxis-relay-preset')?.addEventListener('click', () => {
++        const preset = compatiblePreset('praxis-relay');
++        if (!preset) {
++            setStatus('Praxis Relay preset is unavailable in this build', 'warn');
++            return;
++        }
++        applyInputValue('s-openai-compatible-base-url', preset.baseUrl);
++        const keyInput = byId('s-openai-compatible-key');
++        if (keyInput) {
++            keyInput.value = preset.apiKey || '';
++            delete keyInput.dataset.forceClear;
++        }
++        const defaults = preset.defaults || {};
++        setupModelSlots().forEach((slot) => {
++            if (Object.prototype.hasOwnProperty.call(defaults, slot.slot)) {
++                applyInputValue(slot.settingsInputId, defaults[slot.slot]);
++            }
++        });
++        settingsModelCatalogItems = (preset.models || []).map((value) => ({
++            value,
++            label: 'Praxis Relay',
++            provider: 'OpenAI Compatible',
++        }));
++        updateSettingsDirtyState();
++        setStatus('Praxis Relay preset staged — save settings to activate it', 'ok');
++    });
++
+     byId('btn-claude-code-install')?.addEventListener('click', async () => {
+         applyClaudeCodeStatus({
+             installed: false,
+diff --git a/web/modules/settings_ui.js b/web/modules/settings_ui.js
+index e609e82..6adac9a 100644
+--- a/web/modules/settings_ui.js
++++ b/web/modules/settings_ui.js
+@@ -80,6 +80,12 @@ const PROVIDER_CARDS = [
+             { id: 's-openai-compatible-base-url', label: 'Base URL', placeholder: 'https://provider.example/v1' },
+         ],
+         note: 'Use this card for custom base URLs. Built-in web search only works with the official OpenAI Responses API, so keep <code>OPENAI_BASE_URL</code> empty when you want <code>web_search</code>.',
++        extra: `
++            <div class="settings-toolbar">
++                <button type="button" class="settings-ghost-btn" id="btn-praxis-relay-preset">Use Praxis Relay preset</button>
++                <span class="settings-inline-status">localhost:5011 · key auto</span>
++            </div>
++        `,
+     },
+     {
+         id: 'cloudru', title: 'Cloud.ru Foundation Models', icon: '/static/providers/cloudru.svg', hint: 'Cloud.ru OpenAI-compatible runtime',

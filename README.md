@@ -1,68 +1,90 @@
-# Praxis Relay for Windows
+# Ouroboros patch for Praxis Relay
 
-`relay` is a standalone Rust/Axum service that exposes a small OpenAI-compatible API on
-`127.0.0.1:5011` for a local Praxis deployment.
+Windows PowerShell patcher for the released Ouroboros 6.64.0 one-folder build. It adds one dedicated Praxis Relay preset beside the existing generic OpenAI-compatible provider; the generic provider is not replaced.
 
-This Windows-focused edition adds the Praxis model contract, multimodal input, hosted web
-search mapping, usage-limit reporting, a native Windows build, and a relay-owned OAuth store
-that stays isolated from the user's normal Codex credentials.
+The repository history is preserved. The former relay source was replaced by this focused patch package.
 
-## Upstream and license
+## What the patch adds
 
-This project is derived from
-[unluckyjori/Codex-Proxy-Server](https://github.com/unluckyjori/Codex-Proxy-Server)
-at upstream revision `57417d107dc100d4dfd15fd3fcf11350e9b71088`.
-The original project and this derivative are distributed under the MIT License. The original
-copyright and permission notice are preserved in [LICENSE](LICENSE).
+- Base URL: http://localhost:5011
+- API key: auto
+- Provider route: openai-compatible
+- A Praxis Relay button in onboarding and Settings
+- Relay models in every relevant selector
+- Relay-aware model discovery through GET /v1/models
+- Relay-aware Capability Evidence metadata lookup through GET /v1/models
+- The existing real generative capability check remains active through POST /chat/completions when the catalog does not publish a context window
 
-This project is independently maintained and is not affiliated with or endorsed by OpenAI.
+Selector models:
 
-It exposes:
+- gpt-5.6-sol
+- gpt-5.6-terra
+- gpt-5.6-luna
+- gpt-5.5
+- gpt-5.4
+- gpt-5.4-mini
 
-- `POST /chat/completions`
-- `GET /v1/models`
-- `GET /v1/limits`
-- `GET /health`
+The default Main, Heavy, Vision, and Consciousness model is gpt-5.6-terra. Light and Fallback use gpt-5.4-mini. Pass -Model to choose a different main relay model.
 
-## Run locally
+## Requirements
 
-Install a current Rust toolchain, then run:
+- Extracted official Windows release Ouroboros 6.64.0
+- GitHub Desktop installed
+- Windows PowerShell 5.1
+- Ouroboros stopped during patching
 
-```bash
-cd relay
-cargo run
-```
+The script uses GitHub Desktop's bundled Git CLI directly. It never opens the GitHub Desktop GUI.
 
-Choose `1` in the menu to start the server. The Dockerfile provides a container build for
-Linux deployments; the process deliberately binds only to loopback, so expose it through a
-separate reverse proxy only when that is an explicit deployment decision.
+## Run
 
-### Windows
+From Windows PowerShell:
 
-Build and run the native executable from PowerShell:
+    powershell.exe -ExecutionPolicy Bypass -File .\patch-ouroboros-relay.ps1 -ReleasePath "C:\path\to\Ouroboros"
 
-```powershell
-cargo build --release --locked
-Copy-Item .\target\release\codex-proxy-server.exe .\praxis-relay.exe
-.\praxis-relay.exe
-```
+If the release folder is next to this repository and is named Ouroboros, -ReleasePath can be omitted.
 
-The server itself does not require Python. Menu option `3` (interactive ChatGPT login) uses
-the first working Python 3 launcher among `python.exe`, `py.exe -3`, and `python3.exe`.
-Set `RELAY_PYTHON` to an explicit interpreter path if automatic discovery is unsuitable.
+To select another main model:
 
-### Separate relay authentication
+    powershell.exe -ExecutionPolicy Bypass -File .\patch-ouroboros-relay.ps1 -ReleasePath "C:\path\to\Ouroboros" -Model gpt-5.6-sol
 
-The relay never reads `~/.codex/auth.json`, `~/.opencode/auth.json`, or the generic
-`OPENAI_API_KEY` environment variable. Its credentials live only in `local_auth/auth.json`
-next to the executable, matching the isolated `/app/local_auth` mount used on the server.
+To patch code without changing the current settings.json:
 
-On a clean installation, start the executable and choose menu option `3` to authorize the
-relay account. Then choose `1` to serve the API. To place credentials elsewhere, set
-`RELAY_AUTH_DIR` to an explicit directory before starting the relay.
+    powershell.exe -ExecutionPolicy Bypass -File .\patch-ouroboros-relay.ps1 -ReleasePath "C:\path\to\Ouroboros" -SkipSettings
 
-## Authentication and privacy
+Start Praxis Relay first, then launch Ouroboros.exe.
 
-The relay reads authentication only from its dedicated auth directory. Never commit
-`auth.json`, API keys, session files, or relay logs. This public copy contains source code
-and test fixtures only; it deliberately contains no account data.
+## Commit and startup mechanics
+
+The patch is distributed as a Git mail patch. The script uses git am, so a successful first run always creates a real commit in the launcher-managed Ouroboros repository. It then verifies:
+
+1. the released bundle and patch SHA-256 hashes;
+2. a clean managed worktree;
+3. ancestry from the exact v6.64.0 source commit;
+4. creation of a new commit containing the patch marker;
+5. Ouroboros's own restart gate: unmerged-index check, py_compile server.py, and imports of the core boot surface;
+6. the targeted Python test gate using the release's embedded interpreter;
+7. a clean worktree after the commit;
+8. OpenAI-compatible routing to localhost:5011 with key auto;
+9. invalidation of repo/**/__pycache__ and data/state/pycache before the bootstrap pin is cleared.
+
+Only after those checks does it clear Ouroboros's one-shot bootstrap pin. A repeated run is idempotent: it verifies the existing marker commit and does not create an empty commit.
+
+If the managed branch is still on an older clean release ancestor, the script fast-forwards it to the exact 6.64.0 source before applying the commit.
+
+## Rollback
+
+Before changing Git history, the script creates a local rollback branch named ouroboros-patch-backup/date-time-oldhead. If applying or testing fails, it automatically restores the exact clean starting HEAD.
+
+Before editing existing settings, it creates a timestamped settings.json.praxis-relay.*.bak copy and preserves every unrelated setting.
+
+## Scope and integrity
+
+- Target app version: 6.64.0
+- Target source commit: ffcd09770438f2ebf78b3ec775ec23084e66994b
+- Patch SHA-256: 7207e4a6cdd23b698df70fe98074461d227cfd6c026f747552a5c417cfecc027
+
+The patch intentionally fails closed on other Ouroboros releases or a divergent managed branch. No relay credentials, account data, or relay binaries are included.
+
+## License
+
+MIT. See LICENSE.
